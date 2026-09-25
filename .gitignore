@@ -1,0 +1,39 @@
+# Sanal ortamlar
+.venv/
+venv/
+env/
+
+# Python onbellegi ve arac dosyalari
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Linter / tip denetimi onbellegi
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Ortam degiskenleri ve gizli dosyalar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Gecici / yedek dosyalar
+*.bak
+*.tmp
+*.log
+
+# Sirket verileri: bu klasordeki gercek veriler versiyonlanmaz.
+# Yalnizca .gitkeep ve bu README dosyasi repoya girer.
+company_data/*
+!company_data/.gitkeep
+!company_data/README.md
+
+# Isletim sistemi dosyalari
+.DS_Store
+Thumbs.db
+desktop.ini

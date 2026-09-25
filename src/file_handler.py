@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+import csv
+import json
+import os
+import tempfile
+from collections.abc import Mapping
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from io import BytesIO, StringIO
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pandas as pd
+from pydantic import BaseModel
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUPPORTED_EXTENSIONS = frozenset(
+    {".txt", ".md", ".json", ".csv", ".xlsx", ".pdf", ".docx"}
+)
+TEXT_EXTENSIONS = frozenset({".txt", ".md"})
+
+
+class CompanyFileError(ValueError):
+    pass
+
+
+def _read_positive_integer(name: str, default: int, minimum: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise CompanyFileError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise CompanyFileError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, tuple):
+        return list(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON number: {value}")
+
+
+def _safe_spreadsheet_value(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.lstrip()
+        if stripped.startswith(("=", "+", "-", "@")):
+            return f"'{value}"
+    return value
+
+
+def _safe_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    safe_frame = frame.copy()
+    for column in safe_frame.columns:
+        safe_frame[column] = safe_frame[column].map(_safe_spreadsheet_value)
+    return safe_frame
+
+
+def _read_pdf(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise CompanyFileError(
+            'PDF support requires pypdf. Install it with: pip install "pypdf>=3.0.0"'
+        ) from exc
+
+    sections: list[str] = []
+    has_text = False
+    try:
+        with path.open("rb") as file_handle:
+            reader = PdfReader(file_handle)
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise CompanyFileError(
+                    "PDF is password-protected and cannot be read without a password"
+                )
+            for page_number, page in enumerate(reader.pages, start=1):
+                page_text = (page.extract_text() or "").strip()
+                if page_text:
+                    has_text = True
+                    sections.append(f"--- Sayfa {page_number} ---\n{page_text}")
+                else:
+                    sections.append(
+                        f"--- Sayfa {page_number} ---\n"
+                        "[Bu sayfada metin içeriği bulunamadı.]"
+                    )
+    except CompanyFileError:
+        raise
+    except Exception as exc:
+        raise CompanyFileError(f"PDF dosyası okunamadı: {exc}") from exc
+
+    if not has_text:
+        sections.append(
+            "[UYARI: PDF metin içeriği bulunamadı. Belge taranmış görsel olabilir; "
+            "metin almak için OCR uygulanmalıdır.]"
+        )
+    return "\n\n".join(sections)
+
+
+def _read_docx(path: Path) -> str:
+    try:
+        from docx import Document
+    except ImportError as exc:
+        raise CompanyFileError(
+            "Word support requires python-docx. Install it with: "
+            'pip install "python-docx>=0.8.11"'
+        ) from exc
+
+    try:
+        document = Document(str(path))
+    except Exception as exc:
+        raise CompanyFileError(f"Word belgesi okunamadı: {exc}") from exc
+
+    sections = [
+        paragraph.text.strip()
+        for paragraph in document.paragraphs
+        if paragraph.text.strip()
+    ]
+    for table_number, table in enumerate(document.tables, start=1):
+        sections.append(f"--- Tablo {table_number} ---")
+        table_rows = [
+            " | ".join(" ".join(cell.text.split()) for cell in row.cells)
+            for row in table.rows
+            if any(cell.text.strip() for cell in row.cells)
+        ]
+        sections.extend(table_rows or ["[Tablo boş.]"])
+
+    if not sections:
+        return "[UYARI: Word belgesinde metin veya tablo içeriği bulunamadı.]"
+    return "\n\n".join(sections)
+
+
+class FileHandler:
+    def __init__(
+        self,
+        data_dir: str | Path | None = None,
+        max_file_size_mb: int | None = None,
+    ) -> None:
+        configured_dir = data_dir or os.getenv("COMPANY_DATA_DIR")
+        raw_dir = (
+            Path(configured_dir).expanduser()
+            if configured_dir
+            else PROJECT_ROOT / "company_data"
+        )
+        if not raw_dir.is_absolute():
+            raw_dir = PROJECT_ROOT / raw_dir
+        self.data_dir = raw_dir.resolve()
+        if max_file_size_mb is None:
+            self.max_file_size_mb = _read_positive_integer("COMPANY_MAX_FILE_MB", 10, 1)
+        elif max_file_size_mb < 1:
+            raise CompanyFileError("max_file_size_mb must be at least 1")
+        else:
+            self.max_file_size_mb = max_file_size_mb
+        self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    def resolve_path(self, filename: str) -> tuple[Path, Path]:
+        if not isinstance(filename, str) or not filename.strip():
+            raise CompanyFileError("filename must be a non-empty string")
+        if "\x00" in filename:
+            raise CompanyFileError("filename must not contain null characters")
+
+        relative_path = Path(filename.strip())
+        if relative_path.is_absolute() or relative_path.drive:
+            raise CompanyFileError("absolute paths are not allowed")
+        if ".." in relative_path.parts:
+            raise CompanyFileError("parent directory traversal is not allowed")
+
+        extension = relative_path.suffix.lower()
+        if extension not in SUPPORTED_EXTENSIONS:
+            allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            raise CompanyFileError(
+                f"unsupported file extension '{extension or 'none'}'; allowed: {allowed}"
+            )
+
+        candidate = self.data_dir.joinpath(*relative_path.parts)
+        current = self.data_dir
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink():
+                raise CompanyFileError("symbolic links are not allowed")
+
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(self.data_dir)
+        except ValueError as exc:
+            raise CompanyFileError("path escapes the company data directory") from exc
+
+        return relative_path, candidate
+
+    def list_files(self) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+        if not self.data_dir.exists():
+            return files
+
+        for root, directory_names, filenames in os.walk(
+            self.data_dir, followlinks=False
+        ):
+            root_path = Path(root)
+            directory_names[:] = sorted(
+                name for name in directory_names if not (root_path / name).is_symlink()
+            )
+            for name in sorted(filenames):
+                path = root_path / name
+                if path.is_symlink() or not path.is_file():
+                    continue
+                extension = path.suffix.lower()
+                if extension in TEXT_EXTENSIONS:
+                    file_type = "text"
+                elif extension == ".json":
+                    file_type = "json"
+                elif extension == ".csv":
+                    file_type = "csv"
+                elif extension == ".xlsx":
+                    file_type = "excel"
+                elif extension == ".pdf":
+                    file_type = "pdf"
+                elif extension == ".docx":
+                    file_type = "word"
+                else:
+                    file_type = "unsupported"
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                files.append(
+                    {
+                        "filename": path.relative_to(self.data_dir).as_posix(),
+                        "extension": extension,
+                        "type": file_type,
+                        "supported": extension in SUPPORTED_EXTENSIONS,
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime, timezone.utc
+                        ).isoformat(),
+                    }
+                )
+
+        return sorted(files, key=lambda item: item["filename"].casefold())
+
+    def _ensure_readable_file(self, path: Path) -> None:
+        if not path.exists():
+            raise FileNotFoundError(f"company file not found: {path.name}")
+        if not path.is_file():
+            raise IsADirectoryError(f"company path is not a file: {path.name}")
+        file_size = path.stat().st_size
+        if file_size > self.max_file_size_bytes:
+            limit = self.max_file_size_mb
+            raise CompanyFileError(f"file exceeds the {limit} MB size limit")
+
+    def read_file(self, filename: str) -> str:
+        _, path = self.resolve_path(filename)
+        self._ensure_readable_file(path)
+        extension = path.suffix.lower()
+
+        if extension in TEXT_EXTENSIONS:
+            return path.read_text(encoding="utf-8-sig")
+        if extension == ".json":
+            with path.open("r", encoding="utf-8-sig") as file_handle:
+                data = json.load(
+                    file_handle,
+                    parse_constant=_reject_json_constant,
+                )
+            return json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+                default=_json_default,
+            )
+        if extension == ".csv":
+            frame = pd.read_csv(
+                path,
+                dtype=object,
+                keep_default_na=False,
+                sep=None,
+                engine="python",
+            )
+            return frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
+        if extension == ".xlsx":
+            sections: list[str] = []
+            with pd.ExcelFile(path, engine="openpyxl") as workbook:
+                for sheet_name in workbook.sheet_names:
+                    frame = pd.read_excel(
+                        workbook,
+                        sheet_name=sheet_name,
+                        dtype=object,
+                        keep_default_na=False,
+                    )
+                    csv_text = frame.to_csv(index=False, lineterminator="\n").rstrip(
+                        "\n"
+                    )
+                    sections.append(f"## {sheet_name}\n{csv_text}")
+            return "\n\n".join(sections)
+        if extension == ".pdf":
+            return _read_pdf(path)
+        if extension == ".docx":
+            return _read_docx(path)
+
+        raise CompanyFileError(f"unsupported file extension: {extension}")
+
+    def _serialize_content(self, extension: str, content: Any) -> bytes:
+        if extension in TEXT_EXTENSIONS:
+            if not isinstance(content, str):
+                raise TypeError("TXT and MD content must be a string")
+            return content.encode("utf-8")
+
+        if extension == ".json":
+            if isinstance(content, (bytes, bytearray)):
+                try:
+                    text = bytes(content).decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("JSON content must be UTF-8 encoded") from exc
+            elif isinstance(content, str):
+                text = content
+            elif isinstance(content, (Mapping, list, tuple, BaseModel)):
+                text = json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                    default=_json_default,
+                )
+            else:
+                raise TypeError(
+                    "JSON content must be JSON text, a mapping, a list, or a Pydantic model"
+                )
+            try:
+                json.loads(
+                    text,
+                    parse_constant=_reject_json_constant,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(f"invalid JSON content: {exc}") from exc
+            return text.encode("utf-8")
+
+        if extension == ".csv":
+            if isinstance(content, pd.DataFrame):
+                return (
+                    _safe_dataframe(content)
+                    .to_csv(index=False, lineterminator="\n")
+                    .encode("utf-8")
+                )
+            if isinstance(content, str):
+                pd.read_csv(
+                    StringIO(content),
+                    dtype=object,
+                    keep_default_na=False,
+                    sep=None,
+                    engine="python",
+                )
+                rows = [
+                    [_safe_spreadsheet_value(cell) for cell in row]
+                    for row in csv.reader(StringIO(content))
+                ]
+                output = StringIO()
+                csv.writer(output, lineterminator="\n").writerows(rows)
+                return output.getvalue().encode("utf-8")
+            if isinstance(content, (Mapping, list)):
+                frame = pd.DataFrame(content)
+                return (
+                    _safe_dataframe(frame)
+                    .to_csv(index=False, lineterminator="\n")
+                    .encode("utf-8")
+                )
+            raise TypeError(
+                "CSV content must be text, a DataFrame, a mapping, or a list"
+            )
+
+        if extension == ".xlsx":
+            if isinstance(content, pd.DataFrame):
+                sheets: Mapping[str, pd.DataFrame] = {"Sheet1": content}
+            elif isinstance(content, Mapping):
+                sheets = content
+            else:
+                raise TypeError("XLSX content must be a DataFrame or a sheet mapping")
+            if not sheets:
+                raise ValueError("an XLSX workbook must contain at least one sheet")
+
+            buffer = BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                for sheet_name, sheet_content in sheets.items():
+                    if not isinstance(sheet_name, str) or not sheet_name.strip():
+                        raise ValueError("sheet names must be non-empty strings")
+                    if isinstance(sheet_content, pd.DataFrame):
+                        frame = sheet_content
+                    elif isinstance(sheet_content, (Mapping, list)):
+                        frame = pd.DataFrame(sheet_content)
+                    else:
+                        raise TypeError(
+                            f"worksheet '{sheet_name}' must contain tabular data"
+                        )
+                    _safe_dataframe(frame).to_excel(
+                        writer,
+                        sheet_name=sheet_name,
+                        index=False,
+                    )
+            return buffer.getvalue()
+        if extension in {".pdf", ".docx"}:
+            raise CompanyFileError("PDF and DOCX files are read-only")
+
+        raise CompanyFileError(f"unsupported file extension: {extension}")
+
+    def _atomic_write_bytes(self, target: Path, payload: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as file_handle:
+                file_handle.write(payload)
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            os.replace(temporary_path, target)
+            if os.name != "nt":
+                directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                directory_descriptor = os.open(target.parent, directory_flags)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    def write_file(self, filename: str, content: Any) -> dict[str, Any]:
+        relative_path, target = self.resolve_path(filename)
+        if target.exists() and not target.is_file():
+            raise IsADirectoryError(f"target is not a file: {relative_path.as_posix()}")
+
+        payload = self._serialize_content(relative_path.suffix.lower(), content)
+        if len(payload) > self.max_file_size_bytes:
+            limit = self.max_file_size_mb
+            raise CompanyFileError(f"file exceeds the {limit} MB size limit")
+
+        existed = target.exists()
+        self._atomic_write_bytes(target, payload)
+        return {
+            "filename": relative_path.as_posix(),
+            "size_bytes": len(payload),
+            "created": not existed,
+            "updated": existed,
+        }
+
+
+default_file_handler = FileHandler()
+
+
+def list_files() -> list[dict[str, Any]]:
+    return default_file_handler.list_files()
+
+
+def read_file(filename: str) -> str:
+    return default_file_handler.read_file(filename)
+
+
+def write_file(filename: str, content: Any) -> dict[str, Any]:
+    return default_file_handler.write_file(filename, content)

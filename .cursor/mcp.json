@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ai-company-manager": {
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/run_mcp.sh"
+      ],
+      "env": {
+        "COMPANY_DATA_DIR": "${workspaceFolder}/company_data",
+        "COMPANY_MAX_FILE_MB": "10"
+      }
+    }
+  }
+}
