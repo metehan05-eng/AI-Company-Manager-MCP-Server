@@ -3,76 +3,78 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.30%2B-8A2BE2.svg)](https://modelcontextprotocol.io)
-[![Platformlar](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#hızlı-kurulum)
-[![Taşıma](https://img.shields.io/badge/transport-stdio%20JSON--RPC-5C4EE5.svg)](#mcp-istemci-yapılandırması)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#quick-install)
+[![Transport](https://img.shields.io/badge/transport-stdio%20JSON--RPC-5C4EE5.svg)](#mcp-client-setup)
 
-Yapay zekâ destekli bir MCP (Model Context Protocol) sunucusudur. Cursor, Claude Desktop ve
-OpenCode gibi MCP istemcilerine şirket yönetimi araçları sunar: şirket profili, finans kayıtları,
-personel listesi ve şirket notları **tamamen yerel dosyalarda** tutulur. Veri buluta çıkmaz, API
-anahtarı gerekmez, ücretsizdir.
+An AI-powered MCP (Model Context Protocol) server. It exposes company management tools to MCP
+clients such as Cursor, Claude Desktop and OpenCode: company profile, financial records, employee
+directory and company notes, all stored **in plain local files**. No data leaves your machine, no
+API key is required, and it is free to use.
 
-Tek komutla kurulur, üç platformda (Windows, Linux, macOS) çalışır.
-
----
-
-## İçindekiler
-
-- [Ne İşe Yarar](#ne-işe-yarar)
-- [Özellikler](#özellikler)
-- [Gereksinimler](#gereksinimler)
-- [Hızlı Kurulum](#hızlı-kurulum)
-- [Kurulum Betiğinin Yaptıkları](#kurulum-betiğinin-yaptıkları)
-- [Kurulum Seçenekleri](#kurulum-seçenekleri)
-- [Elle Kurulum](#elle-kurulum)
-- [MCP İstemci Yapılandırması](#mcp-istemci-yapılandırması)
-- [MCP Araçları](#mcp-araçları)
-- [Örnek İstemci İstekleri](#örnek-istemci-istekleri)
-- [Veri Düzeni](#veri-düzeni)
-- [PDF ve DOCX Okuma Davranışı](#pdf-ve-docx-okuma-davranışı)
-- [Yapılandırma](#yapılandırma)
-- [Güvenlik ve Dayanıklılık](#güvenlik-ve-dayanıklılık)
-- [Proje Yapısı](#proje-yapısı)
-- [Geliştirme](#geliştirme)
-- [Yol Haritası](#yol-haritası)
-- [Katkı](#katkı)
-- [Lisans](#lisans)
+Installs with a single command and runs on Windows, Linux and macOS.
 
 ---
 
-## Ne İşe Yarar
+## Table of Contents
 
-Bir MCP istemcisine "şirketimizin nakit akışı ne?", "yeni bir çalışan ekle", "geçen toplantının
-notlarını yaz" dediğinizde sunucu:
+- [What It Does](#what-it-does)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Quick Install](#quick-install)
+- [What the Installer Does](#what-the-installer-does)
+- [Installer Options](#installer-options)
+- [Manual Install](#manual-install)
+- [MCP Client Setup](#mcp-client-setup)
+- [MCP Tools](#mcp-tools)
+- [Example Client Calls](#example-client-calls)
+- [Data Layout](#data-layout)
+- [PDF and DOCX Reading Behavior](#pdf-and-docx-reading-behavior)
+- [Configuration](#configuration)
+- [Security and Resilience](#security-and-resilience)
+- [Project Structure](#project-structure)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
-1. İstekleri doğrulanan bir MCP aracı olarak sunar.
-2. `company_data/` dizinindeki yerel dosyaları okur veya atomik olarak günceller.
-3. Sonucu istemciye metin olarak döndürür.
+---
 
-Böylece yapay zekâ asistanı, şirket verisine **izinsiz erişmeden** ve bulut servisi kullanmadan
-çalışır. Tüm değişiklikler düz metin dosyalarına yazıldığı için verileri istediğiniz an
-yedekleyebilir, gözden geçirebilir veya elle düzenleyebilirsiniz.
+## What It Does
 
-## Özellikler
+When you ask an MCP client "what is our cash flow this month?", "add a new employee" or "save the
+notes from yesterday's meeting", the server:
 
-- **Sıfırdan şirket kurulumu:** profil, finans dosyası, kurucu çalışan kaydı ve standart departman şablonu
-- **Finans takibi:** gelir/gider ekleme, otomatik nakit akışı özeti, mevcut bakiye hesabı
-- **Personel yönetimi:** doğrulanan çalışan kayıtları ve otomatik `EMP-0001` biçiminde personel numarası
-- **Şirket notları:** başlığa göre politika, toplantı, strateji veya vizyon notu oluşturma/güncelleme
-- **Çoklu dosya formatı:** TXT, MD, JSON, CSV ve XLSX okuma/yazma; **PDF ve DOCX okuma**
-- **Atomik dosya yazımı** ve katı yol sınırlama (sembolik bağlantı ve `..` reddi)
-- **Formül enjeksiyonu koruması:** CSV ve XLSX hücrelerinde `=`, `+`, `-`, `@` önekleri etkisizleştirilir
-- **Şifreleme/hesap gerektirmez:** hiçbir dış servise bağlanmaz
-- **Tek komutlu kurulum:** Windows, Linux ve macOS
-- **MCP `stdio` taşıması** (JSON-RPC 2.0)
+1. Exposes the request as a validated MCP tool.
+2. Reads or atomically updates files inside the `company_data/` directory.
+3. Returns the result to the client as text.
 
-## Gereksinimler
+The assistant therefore works on your company data **without unauthorized access** and without any
+cloud service. Because every change is written to plain text files, you can back up, review or edit
+the data at any time with your favorite tools.
 
-- Python 3.10 veya üzeri
-- İnternet erişimi (yalnızca ilk kurulumda bağımlılık indirmek için)
-- `uv` kuruluysa kurulum onunla çok hızlıdır; `uv` yoksa standart `venv` + `pip` yolu kullanılır.
-  Ek paket kurmanız gerekmez.
+## Features
 
-Bağımlılıklar `requirements.txt` içinde sabitlenmiştir:
+- **Zero to running company:** profile, financial file, founder employee record and standard
+  department template
+- **Financial tracking:** income/expense records, automatic cash flow summary, current balance
+- **Employee management:** validated employee records with automatic `EMP-0001` style IDs
+- **Company notes:** create or update policy, meeting, strategy or vision notes by title
+- **Multiple file formats:** read/write TXT, MD, JSON, CSV and XLSX; **read PDF and DOCX**
+- **Atomic file writes** and strict path boundaries (symlinks and `..` are rejected)
+- **Formula injection protection:** leading `=`, `+`, `-` and `@` characters are neutralized in
+  CSV and XLSX cells
+- **No credentials required:** never talks to an external service
+- **One-command install:** Windows, Linux and macOS
+- **MCP `stdio` transport** (JSON-RPC 2.0)
+
+## Requirements
+
+- Python 3.10 or newer
+- Internet access (only to download dependencies during the first install)
+- If [`uv`](https://docs.astral.sh/uv/) is installed the setup is much faster; otherwise the standard
+  `venv` + `pip` path is used. You do not need to install anything else yourself.
+
+Dependencies are pinned in `requirements.txt`:
 
 ```text
 mcp[cli]>=1.30.0,<2.0.0
@@ -83,43 +85,47 @@ pypdf>=3.0.0
 python-docx>=0.8.11
 ```
 
-> **Neden `<2`?** Proje `FastMCP` API'sini kullanır ve MCP Python SDK'nın bakım sürümü olan
-> `>=1.30,<2` aralığına sabitlenmiştir.
+> **Why `<2`?** The project uses the `FastMCP` API, so the MCP Python SDK is pinned to the
+> maintained `>=1.30,<2` range.
 
-## Hızlı Kurulum
+## Quick Install
 
-Projeyi kopyalayıp klasörüne girin ve tek komutu çalıştırın.
+Clone the repository, enter the folder and run a single command.
 
 **Linux / macOS**
 
 ```bash
-cd ai-company-manager-mcp
+git clone https://github.com/metehan05-eng/AI-Company-Manager-MCP-Server.git
+cd AI-Company-Manager-MCP-Server
 python3 install.py
 ```
 
-**Windows (PowerShell veya Komut İstemi)**
+**Windows (PowerShell or Command Prompt)**
 
 ```powershell
-cd ai-company-manager-mcp
+git clone https://github.com/metehan05-eng/AI-Company-Manager-MCP-Server.git
+cd AI-Company-Manager-MCP-Server
 python install.py
 ```
 
-Kurulumdan sonra Cursor'da MCP sunucusunu bir kez kapat/aç. İlk kurulumda paket indirildiği için
-birkaç saniye sürebilir; sonraki çalıştırmalar anlıktır.
+After the install, toggle the MCP server once in Cursor (off/on). The first run downloads packages
+and takes a few seconds; every later start is instant.
 
-## Kurulum Betiğinin Yaptıkları
+## What the Installer Does
 
-`install.py` üç platformda da aynı şekilde çalışır ve sırasıyla:
+`install.py` behaves identically on all three platforms and, in order:
 
-1. **Sanal ortamı kurar.** Proje içinde `.venv` oluşturur ve `requirements.txt` bağımlılıklarını
-   yükler. `uv` varsa onu kullanır (çok hızlı), yoksa `venv` + `pip` yoluna düşer.
-2. **MCP yapılandırmasını yazar.** `<proje>/.cursor/mcp.json` ile `~/.cursor/mcp.json` içine
-   `ai-company-manager` sunucusunu ekler. Claude Desktop yapılandırması varsa oraya da ekler.
-   Var olan sunucular ve ayarlar korunur; geçersiz dosyalar `.bak` olarak yedeklenir.
-3. **Kurulumu doğrular.** Sunucuyu gerçekten başlatır, `initialize` ve `tools/list` istekleri
-   gönderir ve kaç aracın listelendiğini yazar. Böylece "bağlanmıyor" hatasını kurulum anında görürsünüz.
+1. **Creates the environment.** Builds a `.venv` inside the project and installs everything in
+   `requirements.txt`. Uses `uv` when available (very fast), otherwise falls back to `venv` + `pip`.
+2. **Writes the MCP configuration.** Adds the `ai-company-manager` server to
+   `<project>/.cursor/mcp.json` and `~/.cursor/mcp.json`. If a Claude Desktop configuration exists,
+   it is added there too. Existing servers and settings are preserved; invalid files are backed up
+   as `.bak`.
+3. **Verifies the installation.** Actually starts the server, sends `initialize` and `tools/list`
+   requests and prints how many tools were found, so a "cannot connect" failure shows up during
+   setup instead of later.
 
-Tipik çıktı:
+Typical output (installer messages are in Turkish):
 
 ```text
 AI Company Manager MCP kurulumu (linux)
@@ -135,59 +141,60 @@ Sunucu dogrulaniyor...
 Bitti (13.5 saniye).
 ```
 
-## Kurulum Seçenekleri
+## Installer Options
 
-| Seçenek | İşlev |
+| Option | What it does |
 |---|---|
-| `--force` | Sanal ortamı silip baştan oluşturur. |
-| `--skip-deps` | Yalnızca MCP yapılandırmasını yazar (bağımlılık kurmaz). |
-| `--no-global` | `~/.cursor` ve Claude Desktop yapılandırmasına dokunmaz. |
-| `--skip-verify` | Kurulum sonrası canlı sunucu doğrulamasını atlar. |
+| `--force` | Deletes and recreates the virtual environment. |
+| `--skip-deps` | Only writes the MCP configuration (no dependency install). |
+| `--no-global` | Leaves `~/.cursor` and the Claude Desktop configuration untouched. |
+| `--skip-verify` | Skips the live server verification after install. |
 
-Örnekler:
+Examples:
 
 ```bash
-python3 install.py --force        # bozuk sanal ortamı yeniden kur
-python3 install.py --no-global    # yalnızca proje yapılandırmasını yaz
+python3 install.py --force        # rebuild a broken virtual environment
+python3 install.py --no-global    # only write the project configuration
 ```
 
-## Elle Kurulum
+## Manual Install
 
-Kurulum betiğini kullanmak istemezseniz:
+If you prefer not to use the installer script:
 
 ```bash
-cd ai-company-manager-mcp
+cd AI-Company-Manager-MCP-Server
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Windows PowerShell için sanal ortam etkinleştirme:
+Activate the environment on Windows PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-MCP Inspector ile elle test etmek için:
+To try it interactively with MCP Inspector:
 
 ```bash
 mcp dev src/server.py
 ```
 
-> `mcp dev` için Node.js ve `npx` gerekir. Sunucu `stdio` üzerinden konuşur; terminale bilgi yazdırmaz.
+> `mcp dev` requires Node.js and `npx`. The server speaks over `stdio` and prints nothing to the
+> terminal while it waits for an MCP client.
 
-## MCP İstemci Yapılandırması
+## MCP Client Setup
 
-`python install.py` çalıştırıldığında Cursor ve Claude Desktop yapılandırmaları otomatik yazılır.
-Aşağıdaki dosyaları elle yönetmek isterseniz kullanabilirsiniz.
+`python install.py` writes the Cursor and Claude Desktop configuration for you. The files below are
+what you would edit manually.
 
 ### Cursor
 
-Cursor, açtığınız klasörün altındaki `.cursor/mcp.json` dosyasını okur. `${workspaceFolder}`
-değişkeni açılan klasöre çözülür, böylece aynı dosya her bilgisayarda aynı kalır.
+Cursor reads `.cursor/mcp.json` from the folder you open. `${workspaceFolder}` resolves to that
+folder, so the same file works unchanged on every machine.
 
-Linux ve macOS için kurulum betiğinin yazdığı içerik:
+Content written on Linux and macOS:
 
 ```json
 {
@@ -204,18 +211,18 @@ Linux ve macOS için kurulum betiğinin yazdığı içerik:
 }
 ```
 
-Windows'ta `command` değeri `cmd`, `args` ise `["/c", "${workspaceFolder}\\run_mcp.cmd"]` olur.
+On Windows, `command` is `cmd` and `args` is `["/c", "${workspaceFolder}\\run_mcp.cmd"]`.
 
-Klasörü açmadan her projede kullanmak için `~/.cursor/mcp.json` içindeki mutlak yollu girişi
-tercih edebilirsiniz; kurulum betiği her iki dosyayı da günceller.
+To use the server in every project without opening this folder, use the absolute-path entry in
+`~/.cursor/mcp.json`; the installer updates both files.
 
-Başlatıcı betikleri (`run_mcp.sh`, `run_mcp.cmd`) sanal ortam yoksa kendisi kurar ve **tüm kurulum
-çıktısını `stderr`'e yazar**; `stdout` yalnızca MCP protokolüne ayrıdır.
+The launcher scripts (`run_mcp.sh`, `run_mcp.cmd`) create the virtual environment if it is missing
+and write **all installation output to `stderr`**; `stdout` is reserved for the MCP protocol only.
 
 ### Claude Desktop
 
-Claude Desktop genellikle MCP komutunu uygulamanın çalışma dizininden başlatır. Kurulum betiği bu
-nedenle Claude Desktop yapılandırmasına mutlak yollu girişi yazar. Elle yazacaksanız:
+Claude Desktop usually starts MCP commands from its own working directory, which is why the
+installer writes an absolute-path entry into the Claude Desktop configuration. To do it manually:
 
 macOS/Linux:
 
@@ -223,10 +230,10 @@ macOS/Linux:
 {
   "mcpServers": {
     "ai-company-manager": {
-      "command": "/ABSOLUT/PATH/ai-company-manager-mcp/.venv/bin/python",
-      "args": ["/ABSOLUT/PATH/ai-company-manager-mcp/src/server.py"],
+      "command": "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/.venv/bin/python",
+      "args": ["/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/src/server.py"],
       "env": {
-        "COMPANY_DATA_DIR": "/ABSOLUT/PATH/ai-company-manager-mcp/company_data",
+        "COMPANY_DATA_DIR": "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/company_data",
         "COMPANY_MAX_FILE_MB": "10"
       }
     }
@@ -234,12 +241,12 @@ macOS/Linux:
 }
 ```
 
-Windows'ta `command` değeri `.venv\\Scripts\\python.exe` olmalıdır. Değişiklikten sonra Claude
-Desktop yeniden başlatılmalıdır.
+On Windows, `command` must be `.venv\\Scripts\\python.exe`. Restart Claude Desktop after changing
+the configuration.
 
 ### OpenCode
 
-Proje kökünde `opencode.json` oluşturun:
+Create an `opencode.json` in the project root:
 
 ```json
 {
@@ -248,12 +255,12 @@ Proje kökünde `opencode.json` oluşturun:
     "ai-company-manager": {
       "type": "local",
       "command": [
-        "/ABSOLUT/PATH/ai-company-manager-mcp/.venv/bin/python",
-        "/ABSOLUT/PATH/ai-company-manager-mcp/src/server.py"
+        "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/.venv/bin/python",
+        "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/src/server.py"
       ],
       "enabled": true,
       "environment": {
-        "COMPANY_DATA_DIR": "/ABSOLUT/PATH/ai-company-manager-mcp/company_data",
+        "COMPANY_DATA_DIR": "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/company_data",
         "COMPANY_MAX_FILE_MB": "10"
       }
     }
@@ -261,112 +268,112 @@ Proje kökünde `opencode.json` oluşturun:
 }
 ```
 
-OpenCode ayarı yalnızca başlangıçta okunur; değişiklikten sonra yeniden başlatın.
+OpenCode only reads its settings at startup, so restart it after editing.
 
-## MCP Araçları
+## MCP Tools
 
-| Araç | Görev | Zorunlu alanlar |
+| Tool | Purpose | Required arguments |
 |---|---|---|
-| `list_company_files` | Veri dizinindeki tüm dosyaları tür, boyut ve değişiklik zamanıyla listeler. | — |
-| `get_company_overview` | Profil, bütçe, gelir, gider, net nakit akışı ve mevcut bakiye özetini döndürür. | — |
-| `read_company_file` | Desteklenen dosyayı AI'ın analiz edebileceği metne dönüştürür. | `filename` |
-| `create_new_company` | Profil, finans dosyası ve kurucu satırını oluşturur. | `company_name`, `sector`, `initial_budget` |
-| `add_financial_record` | `income` veya `expense` kaydını `financials.json` dosyasına ekler. | `type`, `category`, `amount`, `description` |
-| `add_employee` | Yeni personeli `employees.csv` dosyasına ekler. | `name`, `role`, `department`, `salary` |
-| `update_company_notes` | Başlığa göre politika, toplantı, strateji veya vizyon notu oluşturur/günceller. | `note_title`, `content` |
+| `list_company_files` | Lists every file in the data directory with type, size and modification time. | — |
+| `get_company_overview` | Returns a summary of profile, budget, income, expenses, net cash flow and current balance. | — |
+| `read_company_file` | Converts a supported file into text the AI can analyze. | `filename` |
+| `create_new_company` | Creates the profile, financial file and founder row. | `company_name`, `sector`, `initial_budget` |
+| `add_financial_record` | Appends an `income` or `expense` transaction to `financials.json`. | `type`, `category`, `amount`, `description` |
+| `add_employee` | Appends a validated employee record to `employees.csv`. | `name`, `role`, `department`, `salary` |
+| `update_company_notes` | Creates or updates a policy, meeting, strategy or vision note. | `note_title`, `content` |
 
-Alan sınırları Pydantic ile doğrulanır: boş metin, negatif bütçe, sıfır tutarlı finans kaydı ve
-2.000 karakteri aşan açıklama reddedilir.
+All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
+record or a description longer than 2,000 characters is rejected.
 
-## Örnek İstemci İstekleri
+## Example Client Calls
 
 ```text
-create_new_company(company_name="Atlas Yazılım", sector="SaaS", initial_budget=2500000)
-add_financial_record(type="income", category="services", amount=125000, description="Aylık kurumsal abonelik")
-add_employee(name="Deniz Kaya", role="Kıdemli Geliştirici", department="Bilgi Teknolojileri", salary=95000)
+create_new_company(company_name="Atlas Software", sector="SaaS", initial_budget=2500000)
+add_financial_record(type="income", category="services", amount=125000, description="Monthly enterprise subscription")
+add_employee(name="Deniz Kaya", role="Senior Developer", department="Engineering", salary=95000)
 read_company_file(filename="employees.csv")
 ```
 
-Doğal dilde örnekler:
+Natural language examples:
 
-- "Şirketimizin bu ayki nakit akışını özetle."
-- "Finanslara 45.000 TL'lik sunucu gideri ekle, kategorisi altyapı olsun."
-- "Strateji başlıklı bir not oluştur: 2026'da Avrupa'ya açılmayı hedefliyoruz."
-- "Yönetim raporunu oku ve riskleri çıkar."
+- "Summarize this month's cash flow."
+- "Add a 45,000 expense under the infrastructure category."
+- "Create a note titled Strategy: we are targeting a European launch in 2026."
+- "Read the management report and list the risks."
 
-## Veri Düzeni
+## Data Layout
 
-Depo, gerçek şirket verisi içermez: `company_data/` klasörü boş gelir ve `.gitignore` tarafından
-yok sayılır. Çekirdek dosyalar `create_new_company` aracı ile oluşturulur. Araç, kayıtlı finans
-hareketi veya `employees.csv` bulunan bir şirketi tespit ederse yeni şirket kurmayı reddeder; bu,
-veri kaybını önler. Başka bir şirket kurmadan önce çekirdek dosyaları yedekleyin.
+The repository ships **no real company data**: the `company_data/` folder arrives empty and is
+ignored by `.gitignore`. The core files are created by the `create_new_company` tool. If a company
+with financial records or an `employees.csv` is detected, the tool refuses to create a new company
+so that data cannot be lost. Back up the core files before starting another company.
 
-| Dosya | İçerik |
+| File | Content |
 |---|---|
-| `company_data/company_profile.json` | Şirket adı, sektör, kuruluş tarihi, departmanlar, vizyon ve misyon |
-| `company_data/financials.json` | Bütçe, kategoriler, işlemler ve nakit akışı şablonu |
-| `company_data/employees.csv` | Kurucu ve ek personel kayıtları (`EMP-0001`, `EMP-0002`, ...) |
-| `company_data/company_notes.json` | Şirket notları (ilk `update_company_notes` çağrısında oluşur) |
-| `company_data/*.pdf`, `*.docx` | Kullanıcının eklediği belgeler (salt okunur) |
+| `company_data/company_profile.json` | Company name, sector, founding year, departments, vision, mission, metrics |
+| `company_data/financials.json` | Budget, income/expense categories, transactions, cash flow summary |
+| `company_data/employees.csv` | Founder and employee records (`EMP-0001`, `EMP-0002`, ...) |
+| `company_data/company_notes.json` | Company notes (created on the first `update_company_notes` call) |
+| `company_data/*.pdf`, `*.docx` | Your own documents (read-only) |
 
-Kullanıcılar `company_data/` altına kendi TXT, MD, JSON, CSV, XLSX, PDF veya DOCX belgelerini
-ekleyebilir; `read_company_file` bunları okur.
+You can drop your own TXT, MD, JSON, CSV, XLSX, PDF or DOCX documents into `company_data/`;
+`read_company_file` reads them.
 
-## PDF ve DOCX Okuma Davranışı
+## PDF and DOCX Reading Behavior
 
-| Durum | Davranış |
+| Case | Behavior |
 |---|---|
-| Metin içeren PDF | Her sayfa `--- Sayfa N ---` başlığıyla çıkarılır. |
-| Metin içermeyen PDF | Sayfa için uyarı döner; belgenin taranmış görsel olduğu belirtilir ve OCR önerilir. |
-| Şifreli PDF | Boş parola denenir, başarısızsa anlaşılır bir hata döner. |
-| Bozuk PDF/DOCX | Dosya adı ve teknik ayrıntıyı içeren `CompanyFileError` döner. |
-| DOCX | Tüm paragraflar ve tüm tablolar (`--- Tablo N ---` başlığıyla, satırlar `\|` ile ayrılmış) çıkarılır. |
-| PDF/DOCX yazma | Reddedilir: bu formatlar salt okunurdur. |
-| Eksik bağımlılık | Yükleme komutunu söyleyen anlaşılır bir hata döner. |
+| PDF with text | Every page is extracted under a `--- Sayfa N ---` header. |
+| PDF without text | A warning is returned for the page, noting the file may be a scanned image and that OCR is required. |
+| Encrypted PDF | An empty password is attempted; if that fails a clear error is returned. |
+| Corrupt PDF/DOCX | A `CompanyFileError` with the file name and technical detail is returned. |
+| DOCX | All paragraphs and all tables are extracted (tables under a `--- Tablo N ---` header, cells joined with `\|`). |
+| Writing PDF/DOCX | Rejected: these formats are read-only. |
+| Missing dependency | A clear error is returned including the install command. |
 
-## Yapılandırma
+## Configuration
 
-| Değişken | Varsayılan | Açıklama |
+| Variable | Default | Description |
 |---|---|---|
-| `COMPANY_DATA_DIR` | Proje içindeki `company_data` | Mutlak veya proje köküne göreli veri dizini. |
-| `COMPANY_MAX_FILE_MB` | `10` | Okuma ve yazma için dosya boyutu sınırı (en az 1). |
+| `COMPANY_DATA_DIR` | `company_data` inside the project | Absolute path, or relative to the project root. |
+| `COMPANY_MAX_FILE_MB` | `10` | File size limit for reads and writes (minimum 1). |
 
-`.env.example` yalnızca bir şablondur; ortam değişkenlerini istemci `env` alanından veya işletim
-sistemi üzerinden verin.
+`.env.example` is a template only; provide environment variables through the client `env` field or
+through the operating system.
 
-## Güvenlik ve Dayanıklılık
+## Security and Resilience
 
-- Mutlak yollar, `..` dizin geçişleri ve sembolik bağlantılar reddedilir.
-- Tüm okuma ve yazma işlemleri veri dizini sınırı içinde kalır.
-- Dosyalar aynı dizindeki geçici dosya ve `os.replace` ile atomik olarak güncellenir.
-- Finansal ve personel değişiklikleri aynı sihirbaz kilidi altında yapılır.
-- JSON, sayısal alanlar, tarihler ve tablo sütunları doğrulanır.
-- CSV ve XLSX hücrelerinde formül enjeksiyonu önek karakter ile etkisizleştirilir.
-- Kurulum betiği mevcut MCP yapılandırmalarını üzerine yazmaz, birleştirir.
-- Veriler düz metindir; API anahtarı veya kimlik doğrulama içermez. Düzenli yedek alın.
+- Absolute paths, `..` traversal and symlinks are rejected.
+- Every read and write stays inside the data directory.
+- Files are updated atomically with a temporary file in the same directory plus `os.replace`.
+- Financial and employee changes run under a single wizard lock.
+- JSON structure, numeric fields, dates and table columns are validated.
+- Formula injection is neutralized in CSV and XLSX cells with a prefix character.
+- The installer merges MCP configurations instead of overwriting them.
+- Data is plain text: no API keys, no authentication. Take regular backups.
 
-## Proje Yapısı
+## Project Structure
 
 ```text
-ai-company-manager-mcp/
-├── install.py               # Tek komutlu kurulum (Windows/Linux/macOS)
-├── run_mcp.sh               # Linux/macOS başlatıcısı (sanal ortamı kendisi kurar)
-├── run_mcp.cmd              # Windows başlatıcısı
-├── requirements.txt         # Sabitlenmiş bağımlılıklar
-├── mcp.json                 # Cursor biçiminde örnek yapılandırma
+AI-Company-Manager-MCP-Server/
+├── install.py               # One-command installer (Windows/Linux/macOS)
+├── run_mcp.sh               # Linux/macOS launcher (bootstraps the virtual environment)
+├── run_mcp.cmd              # Windows launcher
+├── requirements.txt         # Pinned dependencies
+├── mcp.json                 # Example configuration in Cursor format
 ├── LICENSE                  # MIT
-├── .env.example             # Ortam değişkeni şablonu
-├── .cursor/mcp.json         # Cursor proje yapılandırması
-├── company_data/            # Şirket verileri (yalnızca burada)
+├── .env.example             # Environment variable template
+├── .cursor/mcp.json         # Cursor project configuration
+├── company_data/            # Company data lives here (and only here)
 └── src/
-    ├── server.py            # MCP araç tanımları (FastMCP)
-    ├── file_handler.py      # Dosya okuma/yazma, yol sınırlama, PDF/DOCX
-    └── company_wizard.py    # İş kuralları, şirket kurulumu, notlar
+    ├── server.py            # MCP tool definitions (FastMCP)
+    ├── file_handler.py      # File I/O, path boundaries, PDF/DOCX
+    └── company_wizard.py    # Business rules, company setup, notes
 ```
 
-## Geliştirme
+## Development
 
-Kod stili ve tip denetimi:
+Code style and type checks:
 
 ```bash
 ruff check src install.py
@@ -374,40 +381,40 @@ ruff format --check src install.py
 mypy --python-version 3.10 --ignore-missing-imports src install.py
 ```
 
-Değişiklikten sonra canlı doğrulama:
+Verify a change against a live server:
 
 ```bash
 python3 install.py
 ```
 
-Bu komut yapılandırmayı yazar, sunucuyu başlatır ve `tools/list` çağrısıyla araç listesini doğrular.
-Yalnızca yapılandırmayı yeniden yazmak isterseniz `python3 install.py --skip-deps` kullanın.
-Yerel MCP Inspector ile uçtan uca denemek için `mcp dev src/server.py` kullanılabilir.
+This writes the configuration, starts the server and validates the tool list with a `tools/list`
+call. Use `python3 install.py --skip-deps` to only rewrite the configuration, and
+`mcp dev src/server.py` for interactive testing with MCP Inspector.
 
-## Yol Haritası
+## Roadmap
 
-- [ ] Otomatik test paketi (`pytest`) ve CI iş akışı
-- [ ] Bütçe ve nakit akışı için dönemsel kırılım tablosu
-- [ ] Excel/PPTX okuma desteği
-- [ ] Çoklu şirket veri dizini seçimi
-- [ ] Yedekleme/arşivleme aracı
+- [ ] Automated test suite (`pytest`) and CI workflow
+- [ ] Period breakdown table for budget and cash flow
+- [ ] Excel/PPTX reading support
+- [ ] Support for multiple company data directories
+- [ ] Backup/archive tool
 
-## Katkı
+## Contributing
 
-Katkılar memnuniyetle karşılanır. Küçük bir adım atmak için:
+Contributions are welcome. To start small:
 
-1. Depoyu çatallayın (fork).
-2. Bir dal açın (`git switch -c ozellik/ozellik-adi`).
-3. Değişikliği yapın ve `ruff` ile `mypy` kontrollerini çalıştırın.
-4. README'de davranış değiştiyse dokümantasyonu güncelleyin.
-5. Bir pull request açın ve neyi neden değiştirdiğinizi kısaca yazın.
+1. Fork the repository.
+2. Create a branch (`git switch -c feature/my-feature`).
+3. Make your change and run the `ruff` and `mypy` checks.
+4. Update the documentation in this README if behavior changed.
+5. Open a pull request and briefly describe what you changed and why.
 
-Yeni bir MCP aracı eklerken `src/server.py` içindeki docstring'i de güncellemeyi unutmayın; bu
-metin istemciye araç açıklaması olarak gider.
+When you add a new MCP tool, remember to update its docstring in `src/server.py`; that text is sent
+to clients as the tool description.
 
-## Lisans
+## License
 
-MIT Lisansı ile lisanslanmıştır. Tam metin için [LICENSE](LICENSE) dosyasına bakın.
+Released under the MIT License. See [LICENSE](LICENSE) for the full text.
 
 ```text
 Copyright (c) 2026 AI Company Manager Contributors
