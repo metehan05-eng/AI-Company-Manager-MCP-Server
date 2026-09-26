@@ -101,6 +101,21 @@ def _normalize_categories(value: list[str]) -> list[str]:
     return normalized
 
 
+def _normalize_money(value: float | str, field_name: str) -> Decimal:
+    try:
+        amount = Decimal(str(value).strip())
+    except ArithmeticError as exc:
+        raise ValueError(f"{field_name} must be a valid number") from exc
+    if not amount.is_finite():
+        raise ValueError(f"{field_name} must be a finite number")
+    exponent = amount.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -2:
+        raise ValueError(
+            f"{field_name} must have at most 2 decimal places (received {value})"
+        )
+    return amount
+
+
 class CompanyProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -342,7 +357,7 @@ class CompanyWizard:
             created_at=timestamp,
             updated_at=timestamp,
         )
-        budget_value = Decimal(str(budget))
+        budget_value = _normalize_money(budget, "initial_budget")
         financials = CompanyFinancials(
             company_name=clean_company_name,
             currency="TRY",
@@ -445,7 +460,7 @@ class CompanyWizard:
         record = FinancialRecord(
             type=normalized_type,
             category=category,
-            amount=Decimal(str(amount)),
+            amount=_normalize_money(amount, "amount"),
             description=description,
         )
         with self._lock:
@@ -495,7 +510,7 @@ class CompanyWizard:
         department: str,
         salary: float,
     ) -> dict[str, Any]:
-        salary_value = Decimal(str(salary))
+        salary_value = _normalize_money(salary, "salary")
         with self._lock:
             frame = self._read_employees()
             numeric_ids = (

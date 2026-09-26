@@ -57,10 +57,40 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON number: {value}")
 
 
+CSV_DELIMITER_CANDIDATES = ",\t;|"
+
+
+def _is_numeric_text(value: str) -> bool:
+    try:
+        Decimal(value.strip())
+    except ArithmeticError:
+        return False
+    return True
+
+
+def _detect_csv_delimiter(sample: str) -> str:
+    if not sample.strip():
+        return ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=CSV_DELIMITER_CANDIDATES)
+    except csv.Error:
+        return ","
+    return dialect.delimiter
+
+
+def _read_csv_frame(text: str) -> pd.DataFrame:
+    return pd.read_csv(
+        StringIO(text),
+        dtype=object,
+        keep_default_na=False,
+        sep=_detect_csv_delimiter(text),
+    )
+
+
 def _safe_spreadsheet_value(value: Any) -> Any:
     if isinstance(value, str):
         stripped = value.lstrip()
-        if stripped.startswith(("=", "+", "-", "@")):
+        if stripped.startswith(("=", "+", "-", "@")) and not _is_numeric_text(stripped):
             return f"'{value}"
     return value
 
@@ -284,13 +314,7 @@ class FileHandler:
                 default=_json_default,
             )
         if extension == ".csv":
-            frame = pd.read_csv(
-                path,
-                dtype=object,
-                keep_default_na=False,
-                sep=None,
-                engine="python",
-            )
+            frame = _read_csv_frame(path.read_text(encoding="utf-8-sig"))
             return frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
         if extension == ".xlsx":
             sections: list[str] = []
@@ -357,13 +381,7 @@ class FileHandler:
                     .encode("utf-8")
                 )
             if isinstance(content, str):
-                pd.read_csv(
-                    StringIO(content),
-                    dtype=object,
-                    keep_default_na=False,
-                    sep=None,
-                    engine="python",
-                )
+                _read_csv_frame(content)
                 rows = [
                     [_safe_spreadsheet_value(cell) for cell in row]
                     for row in csv.reader(StringIO(content))
