@@ -286,6 +286,7 @@ OpenCode only reads its settings at startup, so restart it after editing.
 | `inspect_company_data` | Reports whether each core file matches the expected schema, and why not. | — |
 | `migrate_company_data` | Converts an existing `employees.csv` to the current column schema. | — (`apply` defaults to `false`) |
 | `plan_company_data_migration` | Proposes a field mapping for an existing `company_profile.json` and `financials.json`. Read-only. | — |
+| `apply_company_data_migration` | Writes the mapping you confirmed. Answers every open item first. | — (`apply` defaults to `false`) |
 
 All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
 record or a description longer than 2,000 characters is rejected.
@@ -360,7 +361,8 @@ layout; it is a dry run by default and writes a timestamped backup before applyi
 `company_profile.json` and `financials.json` are **not** rewritten automatically. Real-world
 variants carry custom fields such as `ARR`, `fiscal_year` or runway metrics, and rewriting
 them would destroy data. `inspect_company_data` reports them as `incompatible`;
-`plan_company_data_migration` goes one step further and produces a read-only proposal.
+`plan_company_data_migration` goes one step further and produces a read-only proposal that
+`apply_company_data_migration` can then write once you have answered its questions.
 
 Nothing is ever written. The report splits every source field into one of these buckets:
 
@@ -384,6 +386,32 @@ document can never be copied into place unread. The server never applies an exch
 
 ```json
 {"tool": "plan_company_data_migration", "arguments": {}}
+```
+
+### Confirming the Mapping
+
+`apply_company_data_migration` is the write step for the same mapping. It replans the files
+itself, so it always applies to the current content, and it refuses to write until every open
+item has an answer.
+
+Each question carries a `key` of the form `<file>:<field>`, for example
+`company_profile.json:mission`. Pass them back in `answers`:
+
+- `true` accepts the suggested value.
+- Any other value is used as the final value, so a wrong assumption can be corrected
+  (`"company_profile.json:mission": "Ship faster"`).
+- A key with **no** suggested value rejects `true` and asks for an explicit value, so a
+  missing field can never be confirmed by accident.
+- Unknown keys and unanswered keys are both errors, and nothing is written when they occur.
+
+`apply` defaults to `false`, so the first call is a dry run that shows the exact documents
+and the list of files that would change. Re-run with `apply: true` to write. Only files that
+actually change are touched, and each one is copied to `<name>.backup-<timestamp>.json` first.
+A file that is already canonical is left alone, so the call is safe to repeat.
+
+```json
+{"tool": "apply_company_data_migration", "arguments": {"answers": {"company_profile.json:mission": true}}}
+{"tool": "apply_company_data_migration", "arguments": {"answers": {"company_profile.json:mission": true}, "apply": true}}
 ```
 
 ## PDF and DOCX Reading Behavior
@@ -494,7 +522,7 @@ the server and validates the tool list with a `tools/list` call. Use
 - [x] Automated test suite (`pytest`) and CI workflow
 - [x] Read existing `employees.csv` with common column names; schema inspection and migration
 - [x] Read-only mapping proposals for existing `company_profile.json` and `financials.json`
-- [ ] Apply a confirmed `company_profile.json` / `financials.json` mapping with a backup
+- [x] Apply a confirmed `company_profile.json` / `financials.json` mapping with a backup
 - [ ] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
 - [ ] Character budget for `read_company_file` output and PDF page ranges

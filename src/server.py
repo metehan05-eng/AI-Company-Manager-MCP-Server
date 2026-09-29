@@ -143,9 +143,25 @@ def plan_company_data_migration() -> dict[str, Any]:
 
     Read-only: nothing is written. Reports which source fields are already valid,
     which ones can be mapped and how, which information would be dropped, and the
-    questions that must be answered before the data can be migrated by hand.
+    questions that must be answered before the data can be migrated.
     """
     return company_wizard.plan_company_data_migration()
+
+
+@mcp.tool()
+@readable_errors
+def apply_company_data_migration(
+    answers: dict[str, Any] | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Write a confirmed company_profile.json and financials.json mapping.
+
+    Pass one answer per open item reported by plan_company_data_migration, keyed by
+    its key (for example "company_profile.json:mission"). An answer of true accepts
+    the proposed value; any other answer is used as the final value. Runs as a dry
+    run unless apply=True, and backs up each changed file first.
+    """
+    return company_wizard.apply_company_data_migration(answers=answers, apply=apply)
 
 
 @mcp.tool()

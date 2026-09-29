@@ -6,6 +6,7 @@ import json
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -573,7 +574,7 @@ class TestPlanCompanyDataMigration:
         profile = report["files"]["company_profile.json"]
         assert profile["missing_required"] == ["mission"]
         assert profile["status"] == "needs_decisions"
-        assert any("'mission' is required" in question for question in profile["questions"])
+        assert any("company_profile.json:mission" in question for question in profile["questions"])
         assert "proposed_document" not in profile
 
     def test_bank_balance_maps_to_opening_balance(
@@ -602,16 +603,6 @@ class TestPlanCompanyDataMigration:
         }
         assert item["confidence"] == "needs_confirmation"
 
-    def test_cross_file_company_name_suggestion(
-        self, wizard: CompanyWizard, data_dir: Path
-    ) -> None:
-        write_real_files(data_dir)
-        report = wizard.plan_company_data_migration()
-        assert any(
-            "company_profile.json" in question and "Aetheris" in question
-            for question in report["cross_file_questions"]
-        )
-
     def test_cross_file_currency_mismatch_detected(
         self, wizard: CompanyWizard, data_dir: Path
     ) -> None:
@@ -627,14 +618,30 @@ class TestPlanCompanyDataMigration:
             for question in report["cross_file_questions"]
         )
 
-    def test_cross_file_currency_default_is_flagged(
+    def test_cross_file_company_name_suggestion_becomes_answerable(
         self, wizard: CompanyWizard, data_dir: Path
     ) -> None:
         write_real_files(data_dir)
         report = wizard.plan_company_data_migration()
-        assert any(
-            "canonical default 'TRY'" in question for question in report["cross_file_questions"]
+        item = next(
+            item
+            for item in report["files"]["financials.json"]["open_items"]
+            if item["key"] == "financials.json:company_name"
         )
+        assert "Aetheris" in item["note"]
+        assert "company_profile.json" in item["note"]
+
+    def test_cross_file_currency_default_becomes_answerable(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        item = next(
+            item
+            for item in report["files"]["company_profile.json"]["open_items"]
+            if item["key"] == "company_profile.json:currency"
+        )
+        assert "canonical default 'TRY'" in item["note"]
 
     def test_proposed_document_returned_when_nothing_to_decide(
         self, wizard: CompanyWizard, data_dir: Path
@@ -875,6 +882,187 @@ class TestPlanCompanyDataMigration:
         report = wizard.plan_company_data_migration()
         assert "Nothing was written" in report["next_step"]
         assert "migrate_company_data" in report["next_step"]
+
+    def test_open_items_are_machine_readable(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        keys = {item["key"] for item in report["files"]["company_profile.json"]["open_items"]}
+        assert "company_profile.json:mission" in keys
+        assert "company_profile.json:established_date" in keys
+        assert report["answer_keys"] == sorted(
+            keys | {item["key"] for item in report["files"]["financials.json"]["open_items"]}
+        )
+
+    def test_auto_mapped_fields_create_no_open_item(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        keys = {item["key"] for item in report["files"]["financials.json"]["open_items"]}
+        assert "financials.json:opening_balance" not in keys
+        assert "financials.json:currency" not in keys
+
+    def test_cross_file_company_name_becomes_an_open_item(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        item = next(
+            item
+            for item in report["files"]["financials.json"]["open_items"]
+            if item["key"] == "financials.json:company_name"
+        )
+        assert item["kind"] == "confirmation"
+        assert item["proposed_value"] == REAL_PROFILE["company_name"]
+        assert "company_name" not in report["files"]["financials.json"]["missing_required"]
+
+    def test_currency_question_becomes_an_open_item(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        item = next(
+            item
+            for item in report["files"]["company_profile.json"]["open_items"]
+            if item["key"] == "company_profile.json:currency"
+        )
+        assert item["proposed_value"] == "USD"
+        assert "canonical default 'TRY'" in item["note"]
+
+
+def full_answers() -> dict[str, Any]:
+    return {
+        "company_profile.json:mission": "Kurumsal surecleri hizlandirmak.",
+        "company_profile.json:established_date": True,
+        "company_profile.json:status": True,
+        "company_profile.json:departments": True,
+        "company_profile.json:currency": True,
+        "financials.json:initial_budget": 850_000,
+        "financials.json:records": True,
+        "financials.json:company_name": True,
+    }
+
+
+class TestApplyCompanyDataMigration:
+    def test_requires_every_answer(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        with pytest.raises(ValueError) as excinfo:
+            wizard.apply_company_data_migration(answers={})
+        assert "still need an answer" in str(excinfo.value)
+        assert "company_profile.json:mission" in str(excinfo.value)
+
+    def test_rejects_unknown_answer_keys(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        answers = full_answers()
+        answers["financials.json:gecersiz"] = 1
+        with pytest.raises(ValueError) as excinfo:
+            wizard.apply_company_data_migration(answers=answers)
+        assert "Unknown answer keys: financials.json:gecersiz" in str(excinfo.value)
+
+    def test_dry_run_writes_nothing(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        before = snapshot(data_dir)
+        result = wizard.apply_company_data_migration(answers=full_answers())
+        assert result["applied"] is False
+        assert snapshot(data_dir) == before
+        assert not list(data_dir.glob("*.backup-*.json"))
+        assert "Dry run only" in result["message"]
+
+    def test_apply_writes_canonical_documents(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        result = wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        assert result["applied"] is True
+        assert result["changed"] == ["company_profile.json", "financials.json"]
+        profile = json.loads((data_dir / "company_profile.json").read_text(encoding="utf-8"))
+        assert profile["company_name"] == REAL_PROFILE["company_name"]
+        assert profile["mission"] == "Kurumsal surecleri hizlandirmak."
+        assert profile["established_date"] == "2023-01-01"
+        assert profile["status"] == "active"
+        assert profile["currency"] == "USD"
+        assert profile["departments"] == [
+            "Yazilim ve Yapay Zeka Ar-Ge",
+            "Urun Yonetimi (Product)",
+        ]
+        financials = json.loads((data_dir / "financials.json").read_text(encoding="utf-8"))
+        assert financials["company_name"] == REAL_PROFILE["company_name"]
+        assert financials["currency"] == "USD"
+        assert Decimal(financials["opening_balance"]) == Decimal("850000")
+        assert Decimal(financials["initial_budget"]) == Decimal("850000")
+        assert len(financials["records"]) == 4
+        assert financials["cash_flow_template"]
+
+    def test_apply_creates_backups_of_originals(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        originals = snapshot(data_dir)
+        result = wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        assert set(result["backups"]) == {"company_profile.json", "financials.json"}
+        for name, backup in result["backups"].items():
+            assert (data_dir / backup).read_bytes() == originals[name]
+
+    def test_apply_is_idempotent(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        result = wizard.apply_company_data_migration(answers={}, apply=True)
+        assert result["changed"] == []
+        assert result["backups"] == {}
+        assert "already matched" in result["message"]
+
+    def test_explicit_value_overrides_proposal(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        answers = full_answers()
+        answers["company_profile.json:established_date"] = "2023-06-15"
+        answers["company_profile.json:departments"] = ["Sadece Ar-Ge"]
+        wizard.apply_company_data_migration(answers=answers, apply=True)
+        profile = json.loads((data_dir / "company_profile.json").read_text(encoding="utf-8"))
+        assert profile["established_date"] == "2023-06-15"
+        assert profile["departments"] == ["Sadece Ar-Ge"]
+
+    def test_invalid_answer_is_rejected_before_writing(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        before = snapshot(data_dir)
+        answers = full_answers()
+        answers["financials.json:initial_budget"] = "cok"
+        with pytest.raises(ValueError) as excinfo:
+            wizard.apply_company_data_migration(answers=answers, apply=True)
+        assert "still invalid after applying the answers" in str(excinfo.value)
+        assert snapshot(data_dir) == before
+
+    def test_true_is_rejected_where_nothing_is_suggested(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        before = snapshot(data_dir)
+        answers = full_answers()
+        answers["financials.json:initial_budget"] = True
+        with pytest.raises(ValueError) as excinfo:
+            wizard.apply_company_data_migration(answers=answers, apply=True)
+        assert "No suggested value for: financials.json:initial_budget" in str(excinfo.value)
+        assert snapshot(data_dir) == before
+
+    def test_missing_file_is_rejected(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(data_dir, "company_profile.json", dict(REAL_PROFILE))
+        with pytest.raises(ValueError) as excinfo:
+            wizard.apply_company_data_migration(answers={}, apply=True)
+        assert "financials.json cannot be migrated" in str(excinfo.value)
+
+    def test_canonical_files_need_no_answers(self, company: CompanyWizard, data_dir: Path) -> None:
+        before = snapshot(data_dir)
+        result = company.apply_company_data_migration(answers={}, apply=True)
+        assert result["changed"] == []
+        assert snapshot(data_dir) == before
+        assert result["backups"] == {}
+
+    def test_result_echoes_resolved_answers(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        result = wizard.apply_company_data_migration(answers=full_answers())
+        assert result["resolved"]["company_profile.json:mission"] == (
+            "Kurumsal surecleri hizlandirmak."
+        )
+        assert result["resolved"]["financials.json:records"] is True
 
 
 class TestNotes:

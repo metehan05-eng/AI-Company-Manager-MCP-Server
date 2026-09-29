@@ -451,6 +451,14 @@ def _required_model_fields(model_type: type[BaseModel]) -> list[str]:
     return [name for name, field in model_type.model_fields.items() if field.is_required()]
 
 
+def _describe_open_item(item: dict[str, Any]) -> str:
+    if item["kind"] == "missing_required":
+        return f"{item['key']} is required and no source field provides it. Answer it with a value."
+    source = item.get("source_field")
+    prefix = f"{source!r} -> {item['field']!r}: " if source else f"{item['field']!r}: "
+    return f"{item['key']} needs confirmation. {prefix}{item['note']}"
+
+
 def _apply_transform(name: str, value: Any) -> tuple[Any, str | None]:
     transforms: dict[str, Callable[[Any], tuple[Any, str | None]]] = {
         "copy": _transform_copy,
@@ -1061,8 +1069,10 @@ class CompanyWizard:
         if not path.exists():
             return (
                 {
+                    "filename": filename,
                     "status": "missing",
                     "reason": f"{filename} was not found; initialize a company first",
+                    "_open_items": [],
                     "questions": [],
                 },
                 {},
@@ -1073,8 +1083,10 @@ class CompanyWizard:
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             return (
                 {
+                    "filename": filename,
                     "status": "unreadable",
                     "reason": f"{filename} is not valid JSON: {exc}",
+                    "_open_items": [],
                     "questions": [f"Repair the JSON syntax in {filename} before mapping it."],
                 },
                 {},
@@ -1082,8 +1094,10 @@ class CompanyWizard:
         if not isinstance(source, dict):
             return (
                 {
+                    "filename": filename,
                     "status": "unreadable",
                     "reason": f"{filename} must contain a JSON object at the top level",
+                    "_open_items": [],
                     "questions": [f"Restructure {filename} as a single JSON object."],
                 },
                 {},
@@ -1150,21 +1164,29 @@ class CompanyWizard:
             field for field in _required_model_fields(model_type) if field not in candidate
         ]
 
-        questions: list[str] = [
-            f"{field!r} is required and no source field provides it. Provide a value."
+        open_items: list[dict[str, Any]] = [
+            {
+                "key": f"{filename}:{field}",
+                "kind": "missing_required",
+                "field": field,
+                "note": "This field is required and no source field provides it.",
+            }
             for field in missing_required
         ]
-        questions.extend(
-            f"{item['source_field']!r} -> {item['target_field']}: {item['note']}"
+        open_items.extend(
+            {
+                "key": f"{filename}:{item['target_field']}",
+                "kind": "confirmation",
+                "field": item["target_field"],
+                "source_field": item["source_field"],
+                "note": item["note"],
+            }
             for item in mappable
             if item["confidence"] == "needs_confirmation"
         )
-        questions.extend(
-            f"{item['field']!r} cannot be used as it is: {item['reason']}"
-            for item in incompatible_values
-        )
 
         plan: dict[str, Any] = {
+            "status": "needs_decisions",
             "source_fields": [str(raw_field) for raw_field in source],
             "already_valid": already_valid,
             "mappable": mappable,
@@ -1172,10 +1194,35 @@ class CompanyWizard:
             "incompatible_values": incompatible_values,
             "no_target": no_target,
             "missing_required": missing_required,
-            "questions": questions,
+            "_open_items": open_items,
         }
+        self._finalize_plan(plan, candidate, filename, model_type)
+        return plan, candidate
+
+    def _finalize_plan(
+        self,
+        plan: dict[str, Any],
+        candidate: dict[str, Any],
+        filename: str,
+        model_type: type[BaseModel],
+    ) -> None:
+        """Recompute the derived fields of a plan after its open items changed."""
+        open_items = [
+            {**item, "proposed_value": _summarize_value(candidate.get(item["field"]))}
+            for item in plan["_open_items"]
+        ]
+        plan["_open_items"] = open_items
+        plan["filename"] = filename
+        plan["open_items"] = open_items
+        questions = [_describe_open_item(item) for item in open_items]
+        questions.extend(
+            f"{item['field']!r} cannot be used as it is: {item['reason']}"
+            for item in plan["incompatible_values"]
+        )
+        plan["questions"] = questions
 
         validation_error: str | None = None
+        validated: BaseModel | None = None
         try:
             validated = model_type.model_validate(candidate)
         except ValueError as exc:
@@ -1185,21 +1232,19 @@ class CompanyWizard:
             # Only hand over a ready-to-use document when nothing is left to decide,
             # so it can never be copied into place without being read first.
             plan["status"] = "compatible"
-            plan["proposed_document"] = validated.model_dump(mode="json")
+            plan["proposed_document"] = validated.model_dump(mode="json")  # type: ignore[union-attr]
+            plan.pop("blocked_by", None)
         else:
             plan["status"] = "needs_decisions"
             plan["blocked_by"] = questions or [
                 f"the proposed document is invalid: {validation_error}"
             ]
-        return plan, candidate
+            plan.pop("proposed_document", None)
 
-    def plan_company_data_migration(self) -> dict[str, Any]:
-        """Propose a field mapping for files that do not match the canonical schema.
-
-        This never writes. The report is meant to be read by a person who then
-        decides how to map the data, because real-world variants carry information
-        the canonical models cannot represent.
-        """
+    def _build_migration_plan(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Build the read-only plan plus the internal candidate and open-item state."""
         report: dict[str, Any] = {
             "data_directory": str(self.file_handler.data_dir),
             "writes_performed": False,
@@ -1215,39 +1260,233 @@ class CompanyWizard:
             "financials.json": financial_plan,
         }
 
-        cross_file_questions: list[str] = []
-        profile_name = profile_candidate.get("company_name")
-        if "company_name" in financial_plan.get("missing_required", []) and profile_name:
-            cross_file_questions.append(
-                f"financials.json has no company_name. Add {profile_name!r} to it, taken from "
-                "company_profile.json, so that both files agree."
-            )
-
-        profile_currency = profile_candidate.get("currency")
-        financial_currency = financial_candidate.get("currency")
-        if profile_currency and financial_currency and profile_currency != financial_currency:
-            cross_file_questions.append(
-                f"company_profile.json is {profile_currency!r} but financials.json is "
-                f"{financial_currency!r}. Pick one currency and state whether the amounts are "
-                "already converted; this server never applies an exchange rate."
-            )
-        elif financial_currency and not profile_currency:
-            cross_file_questions.append(
-                "company_profile.json has no currency field, so the canonical default 'TRY' "
-                f"would be used while the ledger is {financial_currency!r}. Add "
-                f'"currency": "{financial_currency}" to the profile.'
-            )
-
-        report["cross_file_questions"] = cross_file_questions
+        report["cross_file_questions"] = self._resolve_cross_file_items(
+            profile_plan, profile_candidate, financial_plan, financial_candidate
+        )
+        report["answer_keys"] = sorted(
+            {item["key"] for plan in (profile_plan, financial_plan) for item in plan["_open_items"]}
+        )
         report["blocking_files"] = [
             name for name, plan in report["files"].items() if plan["status"] != "compatible"
         ]
         report["next_step"] = (
-            "Nothing was written. Answer every question, then edit the two files by hand or "
-            "initialize a new company with create_new_company and re-enter the mapped values. "
-            "employees.csv is handled separately by migrate_company_data."
+            "Nothing was written. Resolve every entry in open_items by calling "
+            "apply_company_data_migration with an answers object keyed by answer_keys, or edit "
+            "the two files by hand. employees.csv is handled separately by "
+            "migrate_company_data."
         )
-        return report
+        candidates = {
+            "company_profile.json": profile_candidate,
+            "financials.json": financial_candidate,
+        }
+        open_items = {
+            "company_profile.json": profile_plan["_open_items"],
+            "financials.json": financial_plan["_open_items"],
+        }
+        for plan in report["files"].values():
+            plan.pop("_open_items", None)
+        return report, candidates, open_items
+
+    def plan_company_data_migration(self) -> dict[str, Any]:
+        """Propose a field mapping for files that do not match the canonical schema.
+
+        This never writes. The report is meant to be read by a person who then
+        decides how to map the data, because real-world variants carry information
+        the canonical models cannot represent.
+        """
+        return self._build_migration_plan()[0]
+
+    def _resolve_cross_file_items(
+        self,
+        profile_plan: dict[str, Any],
+        profile_candidate: dict[str, Any],
+        financial_plan: dict[str, Any],
+        financial_candidate: dict[str, Any],
+    ) -> list[str]:
+        """Turn cross-file problems into answerable open items rather than plain text."""
+        notes: list[str] = []
+        unusable = {"missing", "unreadable"}
+        profile_ok = profile_plan.get("status") not in unusable
+        financial_ok = financial_plan.get("status") not in unusable
+
+        profile_name = profile_candidate.get("company_name")
+        if (
+            profile_ok
+            and financial_ok
+            and "company_name" in financial_plan.get("missing_required", [])
+            and profile_name
+        ):
+            financial_candidate["company_name"] = profile_name
+            financial_plan["missing_required"] = [
+                field for field in financial_plan["missing_required"] if field != "company_name"
+            ]
+            financial_plan["_open_items"] = [
+                item for item in financial_plan["_open_items"] if item["field"] != "company_name"
+            ]
+            financial_plan["_open_items"].append(
+                {
+                    "key": "financials.json:company_name",
+                    "kind": "confirmation",
+                    "field": "company_name",
+                    "note": (
+                        f"financials.json has no company_name, so {profile_name!r} from "
+                        "company_profile.json was proposed to keep both files in agreement."
+                    ),
+                }
+            )
+            self._finalize_plan(
+                financial_plan, financial_candidate, "financials.json", CompanyFinancials
+            )
+
+        profile_currency = profile_candidate.get("currency")
+        financial_currency = financial_candidate.get("currency")
+        if (
+            profile_ok
+            and financial_ok
+            and financial_currency
+            and profile_currency != financial_currency
+        ):
+            if profile_currency is None:
+                note = (
+                    "company_profile.json has no currency field, so the canonical default "
+                    f"'TRY' would be used while the ledger is {financial_currency!r}. The "
+                    f"ledger currency {financial_currency!r} was proposed instead."
+                )
+            else:
+                note = (
+                    f"company_profile.json is {profile_currency!r} but financials.json is "
+                    f"{financial_currency!r}. One currency has to be chosen and the amounts "
+                    "confirmed to already use it; this server never applies an exchange rate."
+                )
+                notes.append(note)
+            profile_candidate["currency"] = financial_currency
+            profile_plan["_open_items"] = [
+                item for item in profile_plan["_open_items"] if item["field"] != "currency"
+            ]
+            profile_plan["_open_items"].append(
+                {
+                    "key": "company_profile.json:currency",
+                    "kind": "confirmation",
+                    "field": "currency",
+                    "note": note,
+                }
+            )
+            self._finalize_plan(
+                profile_plan, profile_candidate, "company_profile.json", CompanyProfile
+            )
+        return notes
+
+    def apply_company_data_migration(
+        self, answers: dict[str, Any] | None = None, apply: bool = False
+    ) -> dict[str, Any]:
+        """Write the confirmed company_profile.json and financials.json mapping.
+
+        Every open item reported by plan_company_data_migration must be answered. An
+        answer of `true` accepts the proposed value; any other answer is used as the
+        final value. Nothing is written unless apply is True, and a timestamped backup
+        of each changed file is written first.
+        """
+        given = {str(key): value for key, value in (answers or {}).items()}
+        report, candidates, open_items = self._build_migration_plan()
+        models: dict[str, type[BaseModel]] = {
+            "company_profile.json": CompanyProfile,
+            "financials.json": CompanyFinancials,
+        }
+
+        expected: dict[str, dict[str, Any]] = {}
+        for filename in models:
+            plan = report["files"][filename]
+            if plan["status"] in {"missing", "unreadable"}:
+                raise ValueError(
+                    f"{filename} cannot be migrated: {plan.get('reason', plan['status'])}"
+                )
+            for item in open_items[filename]:
+                expected[item["key"]] = item
+            for field in plan.get("missing_required", []):
+                key = f"{filename}:{field}"
+                if key not in expected:
+                    expected[key] = {
+                        "kind": "missing_required",
+                        "field": field,
+                        "note": "This field is required and no source field provides it.",
+                    }
+
+        unknown = sorted(set(given) - set(expected))
+        if unknown:
+            raise ValueError(
+                f"Unknown answer keys: {', '.join(unknown)}. Valid keys are: "
+                f"{', '.join(sorted(expected)) or 'none'}"
+            )
+        unresolved = sorted(set(expected) - set(given))
+        if unresolved:
+            raise ValueError(
+                f"{len(unresolved)} open item(s) still need an answer: {', '.join(unresolved)}. "
+                "Run plan_company_data_migration to see what each one is."
+            )
+        unsuggested = sorted(
+            key
+            for key, answer in given.items()
+            if answer is True and expected[key].get("proposed_value") is None
+        )
+        if unsuggested:
+            raise ValueError(
+                f"No suggested value for: {', '.join(unsuggested)}. "
+                "Pass an explicit value instead of true for these keys."
+            )
+
+        documents: dict[str, dict[str, Any]] = {}
+        for filename, model_type in models.items():
+            candidate = dict(candidates[filename])
+            for key, answer in given.items():
+                if key.startswith(f"{filename}:") and answer is not True:
+                    candidate[key.split(":", 1)[1]] = answer
+            try:
+                documents[filename] = model_type.model_validate(candidate).model_dump(mode="json")
+            except ValueError as exc:
+                raise ValueError(
+                    f"{filename} is still invalid after applying the answers: "
+                    f"{str(exc).splitlines()[0]}"
+                ) from exc
+
+        changed = [
+            name
+            for name, document in documents.items()
+            if json.loads((self.file_handler.data_dir / name).read_text(encoding="utf-8"))
+            != document
+        ]
+
+        result: dict[str, Any] = {
+            "applied": apply,
+            "changed": changed,
+            "resolved": dict(sorted(given.items())),
+            "backups": {},
+        }
+
+        if not apply:
+            result["documents"] = documents
+            result["message"] = (
+                "Dry run only. Re-run with apply=True to write the files. Each changed file "
+                "is backed up before it is replaced."
+            )
+            return result
+
+        stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        backups: dict[str, str] = result["backups"]
+        for name in changed:
+            backup_name = name.replace(".json", f".backup-{stamp}.json")
+            self.file_handler.write_file(
+                backup_name, (self.file_handler.data_dir / name).read_text(encoding="utf-8")
+            )
+            backups[name] = backup_name
+        for name, model_type in models.items():
+            self._write_model(name, model_type.model_validate(documents[name]))
+        result["backups"] = backups
+        result["message"] = (
+            "company_profile.json and financials.json migrated successfully"
+            if changed
+            else "Both files already matched; nothing was written."
+        )
+        return result
 
     def update_company_notes(self, note_title: str, content: str) -> dict[str, Any]:
         title = _clean_required_text(note_title, "note_title")

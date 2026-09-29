@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `apply_company_data_migration` tool: writes the mapping that
+  `plan_company_data_migration` proposed. Every open item is answerable by key
+  (`<file>:<field>`); `true` accepts the suggestion and any other value replaces it.
+  Unanswered or unknown keys are refused before anything is written, and a key with no
+  suggestion rejects `true` so a missing field cannot be confirmed by accident.
+  Dry run by default; applies with a timestamped backup of every changed file. Files that
+  already match the canonical schema are left untouched, so the call is safe to repeat.
 - `plan_company_data_migration` tool: a **read-only** proposal for mapping an existing
   `company_profile.json` and `financials.json` onto the canonical models. Every source
   field lands in one of `already_valid`, `mappable`, `skipped_conflicts`,
@@ -35,11 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Actionable error messages that list the columns actually found and point to
   `migrate_company_data`.
 
+### Changed
+
+- Cross-file problems in the migration plan are now answerable open items
+  (`company_profile.json:currency`, `financials.json:company_name`) instead of plain text
+  questions, so they can be confirmed with `apply_company_data_migration`.
+
 ### Not changed
 
 - `company_profile.json` and `financials.json` are still not written automatically.
   Real-world variants carry custom fields (`ARR`, `fiscal_year`, runway) that cannot be
-  mapped without losing data, so the server proposes and lets the user decide.
+  mapped without losing data, so the server proposes and lets the user decide. Writing
+  only happens through `apply_company_data_migration`, and only for the confirmed fields.
 
 ### Planned
 

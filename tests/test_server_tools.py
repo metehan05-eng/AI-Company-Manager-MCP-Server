@@ -25,6 +25,53 @@ PYTHON_EXECUTABLE = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 if not Path(PYTHON_EXECUTABLE).exists():
     PYTHON_EXECUTABLE = sys.executable
 
+_ANSWER_OVERRIDES = {
+    "company_profile.json:mission": "Kurumsal surecleri hizlandirmak.",
+    "financials.json:initial_budget": 850_000,
+}
+
+
+def _all_answers(client: StdioClient) -> dict[str, Any]:
+    """Answer every open item the planner reports, accepting proposals where possible."""
+    report = json.loads(client.call("plan_company_data_migration", {}))
+    return {key: _ANSWER_OVERRIDES.get(key, True) for key in report["answer_keys"]}
+
+
+def _write_legacy_pair(data_dir: Path) -> None:
+    """Drop a realistic pre-migration profile/ledger pair into the data directory."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "company_profile.json").write_text(
+        json.dumps(
+            {
+                "company_name": "Aetheris",
+                "founded_year": 2023,
+                "sector": "Yapay Zeka",
+                "headquarters": "Istanbul",
+                "status": "Aktif",
+                "vision": "AI-native operations",
+                "departments": ["Ar-Ge"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (data_dir / "financials.json").write_text(
+        json.dumps(
+            {
+                "currency": "USD",
+                "bank_balance": 850000,
+                "revenue_breakdown_monthly": [
+                    {
+                        "month": "2025-04",
+                        "revenue": 95000,
+                        "expenses": 62000,
+                        "description": "Nisan",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
 
 class StdioClient:
     def __init__(self, data_dir: Path) -> None:
@@ -112,8 +159,8 @@ def client(data_dir: Path) -> Iterator[StdioClient]:
 
 
 class TestToolRegistration:
-    def test_ten_tools_registered(self) -> None:
-        assert len(mcp._tool_manager.list_tools()) == 10
+    def test_eleven_tools_registered(self) -> None:
+        assert len(mcp._tool_manager.list_tools()) == 11
 
     def test_every_tool_has_description(self) -> None:
         for tool in mcp._tool_manager.list_tools():
@@ -132,6 +179,7 @@ class TestToolRegistration:
             "inspect_company_data",
             "migrate_company_data",
             "plan_company_data_migration",
+            "apply_company_data_migration",
         ],
     )
     def test_tool_exists(self, name: str) -> None:
@@ -141,7 +189,7 @@ class TestToolRegistration:
 class TestLiveProtocol:
     def test_initialize_and_list_tools(self, client: StdioClient) -> None:
         tools = client.request("tools/list")["result"]["tools"]
-        assert len(tools) == 10
+        assert len(tools) == 11
         assert {tool["name"] for tool in tools} == {
             "list_company_files",
             "get_company_overview",
@@ -153,6 +201,7 @@ class TestLiveProtocol:
             "inspect_company_data",
             "migrate_company_data",
             "plan_company_data_migration",
+            "apply_company_data_migration",
         }
 
     def test_schemas_expose_required_fields(self, client: StdioClient) -> None:
@@ -422,6 +471,74 @@ class TestLiveProtocol:
         text = client.call("plan_company_data_migration", {})
         assert '"blocking_files": []' in text
         assert '"proposed_document"' in text
+
+    def test_apply_reports_open_items(self, client: StdioClient) -> None:
+        text = client.call("apply_company_data_migration", {})
+        assert "cannot be migrated" in text
+
+    def test_apply_dry_run_writes_nothing(self, client: StdioClient, data_dir: Path) -> None:
+        _write_legacy_pair(data_dir)
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        text = client.call("apply_company_data_migration", {"answers": _all_answers(client)})
+        after = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        assert after == before
+        assert '"applied": false' in text
+        assert '"changed"' in text
+        assert "Dry run only" in text
+
+    def test_apply_rejects_missing_answers(self, client: StdioClient, data_dir: Path) -> None:
+        _write_legacy_pair(data_dir)
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        text = client.call("apply_company_data_migration", {"answers": {}})
+        after = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        assert after == before
+        assert "still need an answer" in text
+
+    def test_apply_rejects_true_where_nothing_is_suggested(
+        self, client: StdioClient, data_dir: Path
+    ) -> None:
+        _write_legacy_pair(data_dir)
+        answers = _all_answers(client)
+        answers["financials.json:initial_budget"] = True
+        text = client.call("apply_company_data_migration", {"answers": answers})
+        assert "No suggested value for" in text
+        assert not list(data_dir.glob("*.backup-*.json"))
+
+    def test_apply_writes_canonical_files(self, client: StdioClient, data_dir: Path) -> None:
+        _write_legacy_pair(data_dir)
+        text = client.call(
+            "apply_company_data_migration", {"answers": _all_answers(client), "apply": True}
+        )
+        assert '"applied": true' in text
+        profile = json.loads((data_dir / "company_profile.json").read_text(encoding="utf-8"))
+        assert profile["currency"] == "USD"
+        assert profile["established_date"] == "2023-01-01"
+        assert "founded_year" not in profile
+        financials = json.loads((data_dir / "financials.json").read_text(encoding="utf-8"))
+        assert financials["company_name"] == "Aetheris"
+        backups = sorted(data_dir.glob("*.backup-*.json"))
+        assert len(backups) == 2
+
+    def test_apply_backups_preserve_originals(self, client: StdioClient, data_dir: Path) -> None:
+        _write_legacy_pair(data_dir)
+        originals = {path.name: path.read_text(encoding="utf-8") for path in data_dir.iterdir()}
+        client.call(
+            "apply_company_data_migration", {"answers": _all_answers(client), "apply": True}
+        )
+        for backup in data_dir.glob("*.backup-*.json"):
+            stem = backup.name.split(".backup-", 1)[0]
+            assert backup.read_text(encoding="utf-8") == originals[f"{stem}.json"]
+
+    def test_apply_is_idempotent(self, client: StdioClient, data_dir: Path) -> None:
+        _write_legacy_pair(data_dir)
+        client.call(
+            "apply_company_data_migration", {"answers": _all_answers(client), "apply": True}
+        )
+        text = client.call("apply_company_data_migration", {"answers": {}, "apply": True})
+        assert '"applied": true' in text
+        assert '"changed": []' in text
+        assert "already matched" in text
+        assert len(list(data_dir.glob("*.backup-*.json"))) == 2
 
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})
