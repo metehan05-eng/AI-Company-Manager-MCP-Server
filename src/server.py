@@ -138,6 +138,18 @@ def migrate_company_data(apply: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 @readable_errors
+def plan_company_data_migration() -> dict[str, Any]:
+    """Propose how to map an existing company_profile.json and financials.json.
+
+    Read-only: nothing is written. Reports which source fields are already valid,
+    which ones can be mapped and how, which information would be dropped, and the
+    questions that must be answered before the data can be migrated by hand.
+    """
+    return company_wizard.plan_company_data_migration()
+
+
+@mcp.tool()
+@readable_errors
 def update_company_notes(
     note_title: Annotated[str, Field(min_length=1, max_length=200)],
     content: Annotated[str, Field(min_length=1, max_length=100_000)],

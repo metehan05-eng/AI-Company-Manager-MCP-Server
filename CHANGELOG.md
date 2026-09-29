@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plan_company_data_migration` tool: a **read-only** proposal for mapping an existing
+  `company_profile.json` and `financials.json` onto the canonical models. Every source
+  field lands in one of `already_valid`, `mappable`, `skipped_conflicts`,
+  `incompatible_values`, `no_target` or `missing_required`, and each answer is turned into
+  a question the user has to resolve. Nothing is written.
+- `proposed_document` is only returned when no question is open, so a ready-to-use
+  document cannot be copied into place without being read first.
+- Cross-file checks: a ledger without `company_name` is matched against the profile, and
+  a profile that would default to `TRY` while the ledger is in another currency is
+  reported. The server never applies an exchange rate.
+- Fields that look convertible but are not are reported with a reason, e.g.
+  `pending_invoices_receivable` (would overstate income) and percentage-based
+  `major_expense_categories` (not amounts).
 - `inspect_company_data` tool: reports whether each core file matches the expected
   schema, which columns were mapped, and which files still block the other tools.
 - `migrate_company_data` tool: rewrites an existing `employees.csv` in the canonical
@@ -24,15 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Not changed
 
-- `company_profile.json` and `financials.json` are still not auto-migrated. Real-world
-  variants carry custom fields (`ARR`, `fiscal_year`, runway) that cannot be mapped
-  without losing data, so `inspect_company_data` reports them as `incompatible` and
-  leaves the decision to the user.
+- `company_profile.json` and `financials.json` are still not written automatically.
+  Real-world variants carry custom fields (`ARR`, `fiscal_year`, runway) that cannot be
+  mapped without losing data, so the server proposes and lets the user decide.
 
 ### Planned
 
 - `get_financial_report`, `update_employee`, `delete_financial_record`, and
   `list_notes` tools
+- Apply a confirmed profile/ledger mapping with a backup
 
 ## [0.2.0] - 2026-09-29
 

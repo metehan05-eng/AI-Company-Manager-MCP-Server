@@ -4,6 +4,7 @@ import contextlib
 import json
 import re
 import threading
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -14,6 +15,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
     field_validator,
     model_validator,
 )
@@ -86,6 +88,74 @@ EMPLOYEE_COLUMN_ALIASES = {
 
 REQUIRED_EMPLOYEE_COLUMNS = ["name", "role", "department", "salary"]
 DEFAULTED_EMPLOYEE_COLUMNS = ["employee_id", "start_date", "status"]
+
+# Read-only mapping proposals for real-world profile/financial variants. Every rule
+# is a (target_field, transform) pair; a transform returns a note whenever it has to
+# assume or drop information, which downgrades the proposal to "needs_confirmation".
+PROFILE_FIELD_RULES: dict[str, tuple[str, str]] = {
+    "company_name": ("company_name", "copy"),
+    "legal_name": ("company_name", "copy"),
+    "name": ("company_name", "copy"),
+    "sector": ("sector", "copy"),
+    "industry": ("sector", "copy"),
+    "founded_year": ("established_date", "year_to_date"),
+    "establishment_year": ("established_date", "year_to_date"),
+    "founded_at": ("established_date", "iso_date"),
+    "founded": ("established_date", "iso_date"),
+    "established_at": ("established_date", "iso_date"),
+    "vision": ("vision", "copy"),
+    "mission": ("mission", "copy"),
+    "purpose": ("mission", "copy"),
+    "goals": ("mission", "copy"),
+    "departments": ("departments", "department_names"),
+    "teams": ("departments", "department_names"),
+    "currency": ("currency", "currency_code"),
+    "status": ("status", "lifecycle_status"),
+    "created_at": ("created_at", "copy"),
+    "updated_at": ("updated_at", "copy"),
+}
+
+FINANCIAL_FIELD_RULES: dict[str, tuple[str, str]] = {
+    "currency": ("currency", "currency_code"),
+    "company_name": ("company_name", "copy"),
+    "initial_budget": ("initial_budget", "money"),
+    "budget": ("initial_budget", "money"),
+    "initial_capital": ("initial_budget", "money"),
+    "opening_balance": ("opening_balance", "money"),
+    "bank_balance": ("opening_balance", "money"),
+    "cash_balance": ("opening_balance", "money"),
+    "current_balance": ("opening_balance", "money"),
+    "revenue_categories": ("revenue_categories", "category_names"),
+    "expense_categories": ("expense_categories", "category_names"),
+    "records": ("records", "ledger_records"),
+    "transactions": ("records", "ledger_records"),
+    "revenue_breakdown_monthly": ("records", "monthly_records"),
+    "monthly_breakdown": ("records", "monthly_records"),
+    "monthly_financials": ("records", "monthly_records"),
+    "status": ("status", "lifecycle_status"),
+    "created_at": ("created_at", "copy"),
+    "updated_at": ("updated_at", "copy"),
+}
+
+# Fields that look like they belong somewhere but must not be converted silently.
+UNMAPPED_FIELD_NOTES: dict[str, str] = {
+    "headquarters": "The canonical profile has no address field; keep it in a note.",
+    "tax_id": "The canonical profile has no tax identifier field; keep it in a note.",
+    "bank_accounts": "The canonical ledger stores no bank account numbers; keep them outside.",
+    "metrics": "Aggregate metrics have no canonical field; keep them in a company note.",
+    "monthly_runway_months": "Runway is a derived metric, not a ledger field.",
+    "fiscal_year": "The canonical ledger has no fiscal calendar field.",
+    "quarter": "The canonical ledger has no fiscal calendar field.",
+    "major_expense_categories": (
+        "These are percentage shares, not amounts. They cannot become expense "
+        "categories or records without choosing real amounts first."
+    ),
+    "pending_invoices_receivable": (
+        "Receivables are not collected yet, so converting them would overstate "
+        "income. Add them as income records only after they are received."
+    ),
+    "tags": "No canonical field; keep it in a note.",
+}
 
 
 def _utc_now() -> datetime:
@@ -201,6 +271,203 @@ def _normalize_money(value: float | str, field_name: str) -> Decimal:
     if isinstance(exponent, int) and exponent < -2:
         raise ValueError(f"{field_name} must have at most 2 decimal places (received {value})")
     return amount
+
+
+def _transform_copy(value: Any) -> tuple[Any, str | None]:
+    return value, None
+
+
+def _transform_money(value: Any) -> tuple[Any, str | None]:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValueError(f"expected a number, received {value!r}")
+    _normalize_money(str(value), "amount")
+    return value, None
+
+
+def _transform_currency_code(value: Any) -> tuple[Any, str | None]:
+    text = str(value).strip().upper()
+    if text == str(value).strip():
+        return text, None
+    return text, f"Currency code was upper-cased from {value!r} to {text!r}."
+
+
+def _transform_year_to_date(value: Any) -> tuple[Any, str | None]:
+    text = str(value).strip()
+    if not re.fullmatch(r"(1[89]|20)\d{2}", text):
+        raise ValueError(f"expected a four-digit year, received {value!r}")
+    return (
+        f"{text}-01-01",
+        f"The canonical field needs a full date, so {text}-01-01 was assumed. "
+        "Confirm the real founding month and day.",
+    )
+
+
+def _transform_iso_date(value: Any) -> tuple[Any, str | None]:
+    text = str(value).strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    if match is None:
+        raise ValueError(f"expected an ISO date, received {value!r}")
+    if match.group(1) == text:
+        return text, None
+    return match.group(1), f"The time part of {text!r} was dropped; the field only stores a date."
+
+
+def _transform_lifecycle_status(value: Any) -> tuple[Any, str | None]:
+    text = str(value).strip()
+    folded = text.casefold()
+    for canonical in ("template", "active"):
+        if folded == canonical:
+            return canonical, None
+    for canonical in ("template", "active"):
+        if canonical in folded:
+            return canonical, (
+                f"The canonical status only accepts 'template' or 'active', so {text!r} "
+                f"was read as {canonical!r}. Move the extra wording into a note if needed."
+            )
+    raise ValueError(f"expected 'template' or 'active', received {value!r}")
+
+
+def _transform_department_names(value: Any) -> tuple[Any, str | None]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("expected a non-empty list of departments")
+    names: list[str] = []
+    dropped: set[str] = set()
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
+            names.append(item["name"].strip())
+            dropped.update(key for key in item if key != "name")
+        else:
+            raise ValueError("expected a string or an object with a 'name' field")
+    if not names:
+        raise ValueError("no department name could be read")
+    if not dropped:
+        return names, None
+    return names, (
+        "The canonical departments list holds names only, so these keys are dropped: "
+        f"{', '.join(sorted(dropped))}."
+    )
+
+
+def _transform_category_names(value: Any) -> tuple[Any, str | None]:
+    if isinstance(value, dict):
+        return _transform_department_names(list(value))
+    if isinstance(value, list):
+        return _transform_department_names(value)
+    raise ValueError("expected a list or object of category names")
+
+
+def _transform_ledger_records(value: Any) -> tuple[Any, str | None]:
+    if not isinstance(value, list):
+        raise ValueError("expected a list of transactions")
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or "amount" not in item:
+            raise ValueError("every transaction needs an 'amount' field")
+        kind = str(item.get("type", "")).strip().casefold()
+        if kind not in {"income", "expense"}:
+            raise ValueError("every transaction needs 'type' set to income or expense")
+        records.append(
+            {
+                "type": kind,
+                "category": str(item.get("category", "")).strip(),
+                "amount": item["amount"],
+                "description": str(item.get("description", "")).strip(),
+            }
+        )
+    return records, "Each transaction is re-created with a new id and the current timestamp."
+
+
+def _transform_monthly_records(value: Any) -> tuple[Any, str | None]:
+    """Expand a monthly breakdown into canonical income and expense records."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("expected a non-empty list of monthly entries")
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("expected an object per month")
+        period = str(item.get("month") or item.get("period") or "").strip()
+        if not period:
+            raise ValueError("every monthly entry needs a 'month' or 'period' label")
+        income = _first_present(item, ("mrr", "revenue", "income"))
+        expense = _first_present(item, ("expenses", "expense", "costs"))
+        if income is None or expense is None:
+            raise ValueError(
+                f"month {period!r} needs both a revenue and an expense amount to be converted"
+            )
+        records.append(
+            {
+                "type": "income",
+                "category": "sales",
+                "amount": income,
+                "description": f"Monthly revenue - {period}",
+            }
+        )
+        records.append(
+            {
+                "type": "expense",
+                "category": "other_expense",
+                "amount": expense,
+                "description": f"Monthly expenses - {period}",
+            }
+        )
+    return records, (
+        f"{len(value)} monthly rows become {len(records)} ledger records using the default "
+        "categories 'sales' and 'other_expense'. Choose real categories per month, and "
+        "confirm the amounts are already in the file's own currency."
+    )
+
+
+def _first_present(source: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if source.get(key) is not None:
+            return source[key]
+    return None
+
+
+def _summarize_value(value: Any) -> Any:
+    """Keep reports small: collapse long lists and drop generated identifiers."""
+    if isinstance(value, list):
+        if len(value) > 3:
+            head = [_summarize_value(item) for item in value[:3]]
+            return {"items": len(value), "first_items": head}
+        return [_summarize_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _summarize_value(item) for key, item in value.items() if key != "id"}
+    return value
+
+
+def _field_accepts_value(model_type: type[BaseModel], field_name: str, value: Any) -> bool:
+    field = model_type.model_fields[field_name]
+    try:
+        TypeAdapter(field.annotation).validate_python(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _required_model_fields(model_type: type[BaseModel]) -> list[str]:
+    return [name for name, field in model_type.model_fields.items() if field.is_required()]
+
+
+def _apply_transform(name: str, value: Any) -> tuple[Any, str | None]:
+    transforms: dict[str, Callable[[Any], tuple[Any, str | None]]] = {
+        "copy": _transform_copy,
+        "money": _transform_money,
+        "currency_code": _transform_currency_code,
+        "year_to_date": _transform_year_to_date,
+        "iso_date": _transform_iso_date,
+        "lifecycle_status": _transform_lifecycle_status,
+        "department_names": _transform_department_names,
+        "category_names": _transform_category_names,
+        "ledger_records": _transform_ledger_records,
+        "monthly_records": _transform_monthly_records,
+    }
+    transform = transforms.get(name)
+    if transform is None:
+        raise ValueError(f"unknown transform {name!r}")
+    return transform(value)
 
 
 class CompanyProfile(BaseModel):
@@ -783,6 +1050,204 @@ class CompanyWizard:
         result["backup_file"] = backup_name
         result["message"] = "employees.csv migrated successfully"
         return result
+
+    def _plan_json_file(
+        self,
+        filename: str,
+        model_type: type[BaseModel],
+        rules: dict[str, tuple[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        path = self.file_handler.data_dir / filename
+        if not path.exists():
+            return (
+                {
+                    "status": "missing",
+                    "reason": f"{filename} was not found; initialize a company first",
+                    "questions": [],
+                },
+                {},
+            )
+
+        try:
+            source = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            return (
+                {
+                    "status": "unreadable",
+                    "reason": f"{filename} is not valid JSON: {exc}",
+                    "questions": [f"Repair the JSON syntax in {filename} before mapping it."],
+                },
+                {},
+            )
+        if not isinstance(source, dict):
+            return (
+                {
+                    "status": "unreadable",
+                    "reason": f"{filename} must contain a JSON object at the top level",
+                    "questions": [f"Restructure {filename} as a single JSON object."],
+                },
+                {},
+            )
+
+        already_valid: dict[str, Any] = {}
+        mappable: list[dict[str, Any]] = []
+        skipped_conflicts: list[dict[str, Any]] = []
+        incompatible_values: list[dict[str, Any]] = []
+        no_target: dict[str, str | None] = {}
+        candidate: dict[str, Any] = {}
+
+        for raw_field, value in source.items():
+            field = str(raw_field)
+            key = _normalize_column_key(raw_field)
+            if key in model_type.model_fields and _field_accepts_value(model_type, key, value):
+                already_valid[key] = value
+                candidate.setdefault(key, value)
+                continue
+
+            rule = rules.get(key)
+            if rule is None:
+                if key in model_type.model_fields:
+                    incompatible_values.append(
+                        {
+                            "field": field,
+                            "reason": f"the value for {field!r} is not accepted by {key!r}",
+                        }
+                    )
+                else:
+                    no_target[field] = UNMAPPED_FIELD_NOTES.get(key)
+                continue
+
+            target, transform = rule
+            if target in candidate:
+                skipped_conflicts.append(
+                    {
+                        "field": field,
+                        "target_field": target,
+                        "note": f"{field!r} also targets {target!r}, which is already filled.",
+                    }
+                )
+                continue
+
+            try:
+                proposed, note = _apply_transform(transform, value)
+            except ValueError as exc:
+                incompatible_values.append({"field": field, "reason": str(exc)})
+                continue
+
+            candidate[target] = proposed
+            mappable.append(
+                {
+                    "source_field": field,
+                    "target_field": target,
+                    "transform": transform,
+                    "confidence": "needs_confirmation" if note else "auto",
+                    "proposed_value": _summarize_value(proposed),
+                    "note": note,
+                }
+            )
+
+        missing_required = [
+            field for field in _required_model_fields(model_type) if field not in candidate
+        ]
+
+        questions: list[str] = [
+            f"{field!r} is required and no source field provides it. Provide a value."
+            for field in missing_required
+        ]
+        questions.extend(
+            f"{item['source_field']!r} -> {item['target_field']}: {item['note']}"
+            for item in mappable
+            if item["confidence"] == "needs_confirmation"
+        )
+        questions.extend(
+            f"{item['field']!r} cannot be used as it is: {item['reason']}"
+            for item in incompatible_values
+        )
+
+        plan: dict[str, Any] = {
+            "source_fields": [str(raw_field) for raw_field in source],
+            "already_valid": already_valid,
+            "mappable": mappable,
+            "skipped_conflicts": skipped_conflicts,
+            "incompatible_values": incompatible_values,
+            "no_target": no_target,
+            "missing_required": missing_required,
+            "questions": questions,
+        }
+
+        validation_error: str | None = None
+        try:
+            validated = model_type.model_validate(candidate)
+        except ValueError as exc:
+            validation_error = str(exc).splitlines()[0]
+
+        if validation_error is None and not questions:
+            # Only hand over a ready-to-use document when nothing is left to decide,
+            # so it can never be copied into place without being read first.
+            plan["status"] = "compatible"
+            plan["proposed_document"] = validated.model_dump(mode="json")
+        else:
+            plan["status"] = "needs_decisions"
+            plan["blocked_by"] = questions or [
+                f"the proposed document is invalid: {validation_error}"
+            ]
+        return plan, candidate
+
+    def plan_company_data_migration(self) -> dict[str, Any]:
+        """Propose a field mapping for files that do not match the canonical schema.
+
+        This never writes. The report is meant to be read by a person who then
+        decides how to map the data, because real-world variants carry information
+        the canonical models cannot represent.
+        """
+        report: dict[str, Any] = {
+            "data_directory": str(self.file_handler.data_dir),
+            "writes_performed": False,
+        }
+        profile_plan, profile_candidate = self._plan_json_file(
+            "company_profile.json", CompanyProfile, PROFILE_FIELD_RULES
+        )
+        financial_plan, financial_candidate = self._plan_json_file(
+            "financials.json", CompanyFinancials, FINANCIAL_FIELD_RULES
+        )
+        report["files"] = {
+            "company_profile.json": profile_plan,
+            "financials.json": financial_plan,
+        }
+
+        cross_file_questions: list[str] = []
+        profile_name = profile_candidate.get("company_name")
+        if "company_name" in financial_plan.get("missing_required", []) and profile_name:
+            cross_file_questions.append(
+                f"financials.json has no company_name. Add {profile_name!r} to it, taken from "
+                "company_profile.json, so that both files agree."
+            )
+
+        profile_currency = profile_candidate.get("currency")
+        financial_currency = financial_candidate.get("currency")
+        if profile_currency and financial_currency and profile_currency != financial_currency:
+            cross_file_questions.append(
+                f"company_profile.json is {profile_currency!r} but financials.json is "
+                f"{financial_currency!r}. Pick one currency and state whether the amounts are "
+                "already converted; this server never applies an exchange rate."
+            )
+        elif financial_currency and not profile_currency:
+            cross_file_questions.append(
+                "company_profile.json has no currency field, so the canonical default 'TRY' "
+                f"would be used while the ledger is {financial_currency!r}. Add "
+                f'"currency": "{financial_currency}" to the profile.'
+            )
+
+        report["cross_file_questions"] = cross_file_questions
+        report["blocking_files"] = [
+            name for name, plan in report["files"].items() if plan["status"] != "compatible"
+        ]
+        report["next_step"] = (
+            "Nothing was written. Answer every question, then edit the two files by hand or "
+            "initialize a new company with create_new_company and re-enter the mapped values. "
+            "employees.csv is handled separately by migrate_company_data."
+        )
+        return report
 
     def update_company_notes(self, note_title: str, content: str) -> dict[str, Any]:
         title = _clean_required_text(note_title, "note_title")

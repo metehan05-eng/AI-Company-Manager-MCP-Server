@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.company_wizard import CompanyWizard
+from src.company_wizard import CompanyWizard, _apply_transform
 from src.file_handler import FileHandler
 
 
@@ -435,6 +436,445 @@ class TestMigrateCompanyData:
         wizard.migrate_company_data(apply=True)
         result = wizard.add_employee("Probe", "QA", "Ar-Ge", 1_000.0)
         assert result["employee"]["employee_id"] == "EMP-0103"
+
+
+REAL_PROFILE = {
+    "company_name": "Aetheris Dynamics Tech A.Ş.",
+    "founded_year": 2023,
+    "sector": "Enterprise Software & AI Solutions",
+    "headquarters": "Istanbul, Turkiye",
+    "status": "Active / Series-A Funded",
+    "vision": "Otonom yapay zeka ajanlari ile sureclerin yuzde 80 hizlanmasi.",
+    "metrics": {"arr_usd": 1200000, "total_employees": 24},
+    "departments": [
+        {"name": "Yazilim ve Yapay Zeka Ar-Ge", "lead": "Metehan (CTO)", "headcount": 10},
+        {"name": "Urun Yonetimi (Product)", "lead": "Selin (CPO)", "headcount": 4},
+    ],
+}
+
+REAL_FINANCIALS = {
+    "currency": "USD",
+    "fiscal_year": 2026,
+    "quarter": "Q3",
+    "bank_balance": 850000.00,
+    "monthly_runway_months": 14,
+    "revenue_breakdown_monthly": [
+        {"month": "Haziran", "mrr": 95000, "expenses": 62000, "net_profit": 33000},
+        {"month": "Temmuz", "mrr": 102000, "expenses": 65000, "net_profit": 37000},
+    ],
+    "major_expense_categories": {"payroll_salaries": "%55", "marketing_and_events": "%8"},
+    "pending_invoices_receivable": [
+        {
+            "client": "Global Logistics",
+            "amount": 25000,
+            "due_date": "2026-10-15",
+            "status": "Pending",
+        }
+    ],
+}
+
+
+def write_json(data_dir: Path, filename: str, payload: dict[str, object]) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / filename).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def write_real_files(data_dir: Path) -> None:
+    write_json(data_dir, "company_profile.json", REAL_PROFILE)
+    write_json(data_dir, "financials.json", REAL_FINANCIALS)
+
+
+def write_file(data_dir: Path, filename: str, content: str) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / filename).write_text(content, encoding="utf-8")
+
+
+def snapshot(data_dir: Path) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+
+
+class TestPlanCompanyDataMigration:
+    def test_never_writes_anything(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        before = snapshot(data_dir)
+        report = wizard.plan_company_data_migration()
+        assert report["writes_performed"] is False
+        assert snapshot(data_dir) == before
+        assert sorted(before) == ["company_profile.json", "financials.json"]
+
+    def test_missing_files_reported(self, wizard: CompanyWizard) -> None:
+        report = wizard.plan_company_data_migration()
+        assert report["files"]["company_profile.json"]["status"] == "missing"
+        assert report["files"]["financials.json"]["status"] == "missing"
+        assert report["blocking_files"] == [
+            "company_profile.json",
+            "financials.json",
+        ]
+
+    def test_canonical_files_need_no_decisions(self, company: CompanyWizard) -> None:
+        report = company.plan_company_data_migration()
+        assert report["files"]["company_profile.json"]["status"] == "compatible"
+        assert report["files"]["financials.json"]["status"] == "compatible"
+        assert report["blocking_files"] == []
+        assert report["cross_file_questions"] == []
+
+    def test_valid_fields_are_reused_unchanged(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["already_valid"] == {
+            "company_name": REAL_PROFILE["company_name"],
+            "sector": REAL_PROFILE["sector"],
+            "vision": REAL_PROFILE["vision"],
+        }
+
+    def test_founded_year_needs_confirmation(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "founded_year")
+        assert item["target_field"] == "established_date"
+        assert item["proposed_value"] == "2023-01-01"
+        assert item["confidence"] == "needs_confirmation"
+        assert "founding month" in item["note"]
+
+    def test_department_objects_lose_their_extra_keys(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "departments")
+        assert item["proposed_value"] == [
+            "Yazilim ve Yapay Zeka Ar-Ge",
+            "Urun Yonetimi (Product)",
+        ]
+        assert "headcount" in item["note"]
+        assert "lead" in item["note"]
+
+    def test_free_form_status_is_narrowed(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "status")
+        assert item["proposed_value"] == "active"
+        assert "Series-A Funded" in item["note"]
+
+    def test_fields_without_a_target_are_listed_with_a_reason(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        assert "metrics" in report["files"]["company_profile.json"]["no_target"]
+        financials = report["files"]["financials.json"]["no_target"]
+        assert "overstate income" in financials["pending_invoices_receivable"]
+        assert "percentage shares" in financials["major_expense_categories"]
+        assert financials["monthly_runway_months"]
+
+    def test_missing_mission_is_a_question(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        profile = report["files"]["company_profile.json"]
+        assert profile["missing_required"] == ["mission"]
+        assert profile["status"] == "needs_decisions"
+        assert any("'mission' is required" in question for question in profile["questions"])
+        assert "proposed_document" not in profile
+
+    def test_bank_balance_maps_to_opening_balance(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "bank_balance")
+        assert item["target_field"] == "opening_balance"
+        assert item["confidence"] == "auto"
+        assert item["proposed_value"] == 850000.0
+
+    def test_monthly_breakdown_expands_to_records(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "revenue_breakdown_monthly")
+        assert item["target_field"] == "records"
+        assert item["proposed_value"]["items"] == 4
+        assert item["proposed_value"]["first_items"][0] == {
+            "type": "income",
+            "category": "sales",
+            "amount": 95000,
+            "description": "Monthly revenue - Haziran",
+        }
+        assert item["confidence"] == "needs_confirmation"
+
+    def test_cross_file_company_name_suggestion(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        assert any(
+            "company_profile.json" in question and "Aetheris" in question
+            for question in report["cross_file_questions"]
+        )
+
+    def test_cross_file_currency_mismatch_detected(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(data_dir, "financials.json", dict(REAL_FINANCIALS, currency="EUR"))
+        write_json(
+            data_dir,
+            "company_profile.json",
+            dict(REAL_PROFILE, currency="TRY", established_date="2023-05-01"),
+        )
+        report = wizard.plan_company_data_migration()
+        assert any(
+            "'TRY'" in question and "'EUR'" in question
+            for question in report["cross_file_questions"]
+        )
+
+    def test_cross_file_currency_default_is_flagged(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        assert any(
+            "canonical default 'TRY'" in question for question in report["cross_file_questions"]
+        )
+
+    def test_proposed_document_returned_when_nothing_to_decide(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {
+                "company_name": "Acme",
+                "sector": "Yazilim",
+                "established_date": "2023-05-01",
+                "vision": "v",
+                "mission": "m",
+                "currency": "USD",
+                "departments": ["Ar-Ge", "Finans"],
+            },
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["status"] == "compatible"
+        assert plan["questions"] == []
+        assert plan["proposed_document"]["company_name"] == "Acme"
+        assert plan["proposed_document"]["established_date"] == "2023-05-01"
+
+    def test_alias_names_are_recognized(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {
+                "legal_name": "Acme",
+                "industry": "Yazilim",
+                "established_at": "2023-05-01T10:00:00Z",
+                "purpose": "m",
+                "vision": "v",
+                "teams": ["Ar-Ge"],
+                "status": "Active",
+            },
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        # established_at carries a time, so it can only be proposed, not applied as is.
+        assert plan["status"] == "needs_decisions"
+        assert "proposed_document" not in plan
+        assert any("time part" in question for question in plan["questions"])
+        assert "proposed_document" not in plan
+        proposed = {item["source_field"]: item for item in plan["mappable"]}
+        assert proposed["legal_name"]["target_field"] == "company_name"
+        assert proposed["industry"]["target_field"] == "sector"
+        assert proposed["established_at"]["proposed_value"] == "2023-05-01"
+        assert proposed["purpose"]["target_field"] == "mission"
+        assert proposed["purpose"]["confidence"] == "auto"
+        assert proposed["teams"]["proposed_value"] == ["Ar-Ge"]
+        assert proposed["status"]["proposed_value"] == "active"
+
+    def test_broken_json_is_reported_not_raised(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_file(data_dir, "company_profile.json", "{not json")
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["status"] == "unreadable"
+        assert "not valid JSON" in plan["reason"]
+
+    def test_json_array_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_file(data_dir, "financials.json", "[1, 2, 3]")
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert plan["status"] == "unreadable"
+        assert "JSON object at the top level" in plan["reason"]
+
+    def test_conflicting_targets_are_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {
+                "company_name": "Acme",
+                "legal_name": "Acme A.Ş.",
+                "sector": "Yazilim",
+                "established_date": "2023-05-01",
+                "vision": "v",
+                "mission": "m",
+            },
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["already_valid"]["company_name"] == "Acme"
+        assert plan["skipped_conflicts"][0]["field"] == "legal_name"
+
+    def test_unusable_value_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {"currency": "USD", "initial_budget": "cok", "opening_balance": 1},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert plan["incompatible_values"] == [
+            {"field": "initial_budget", "reason": "amount must be a valid number"}
+        ]
+
+    def test_non_numeric_ledger_transaction_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {"currency": "USD", "transactions": [{"type": "income", "amount": 10}]},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        item = plan["mappable"][0]
+        assert item["proposed_value"] == [
+            {
+                "type": "income",
+                "category": "",
+                "amount": 10,
+                "description": "",
+            }
+        ]
+        assert "new id" in item["note"]
+
+    def test_ledger_transaction_without_type_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {"currency": "USD", "transactions": [{"amount": 10}]},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert plan["incompatible_values"] == [
+            {
+                "field": "transactions",
+                "reason": "every transaction needs 'type' set to income or expense",
+            }
+        ]
+
+    def test_month_without_revenue_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {"currency": "USD", "monthly_breakdown": [{"month": "Ocak", "mrr": 10}]},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert "revenue and an expense amount" in plan["incompatible_values"][0]["reason"]
+
+    def test_monthly_entry_without_label_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {"currency": "USD", "monthly_breakdown": [{"mrr": 10, "expenses": 5}]},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert "month" in plan["incompatible_values"][0]["reason"]
+
+    def test_empty_monthly_list_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(data_dir, "financials.json", {"currency": "USD", "monthly_breakdown": []})
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        assert "non-empty list" in plan["incompatible_values"][0]["reason"]
+
+    def test_departments_wrong_shape_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "departments": 5},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert "non-empty list" in plan["incompatible_values"][0]["reason"]
+
+    def test_department_item_without_name_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "departments": [{"lead": "X"}]},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert "'name' field" in plan["incompatible_values"][0]["reason"]
+
+    def test_bad_year_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "founded_year": "1999 yili"},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert "four-digit year" in plan["incompatible_values"][0]["reason"]
+
+    def test_bad_status_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "status": "dondurulmus"},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert "expected 'template' or 'active'" in plan["incompatible_values"][0]["reason"]
+
+    def test_bad_date_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "founded": "Mart 2023"},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert "expected an ISO date" in plan["incompatible_values"][0]["reason"]
+
+    def test_canonical_field_with_bad_value_is_reported(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "status": "acik"},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["incompatible_values"] == [
+            {"field": "status", "reason": "expected 'template' or 'active', received 'acik'"}
+        ]
+
+    def test_unknown_transform_guard(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _apply_transform("yok", 1)
+        assert "unknown transform" in str(excinfo.value)
+
+    def test_category_names_from_dict_keys(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(
+            data_dir,
+            "financials.json",
+            {
+                "currency": "USD",
+                "expense_categories": {"payroll": 1, "rent": 2},
+            },
+        )
+        plan = wizard.plan_company_data_migration()["files"]["financials.json"]
+        item = next(i for i in plan["mappable"] if i["source_field"] == "expense_categories")
+        assert item["proposed_value"] == ["payroll", "rent"]
+
+    def test_next_step_explains_manual_work(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_real_files(data_dir)
+        report = wizard.plan_company_data_migration()
+        assert "Nothing was written" in report["next_step"]
+        assert "migrate_company_data" in report["next_step"]
 
 
 class TestNotes:

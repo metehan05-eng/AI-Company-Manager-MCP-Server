@@ -28,6 +28,8 @@ Installs with a single command and runs on Windows, Linux and macOS.
 - [MCP Tools](#mcp-tools)
 - [Example Client Calls](#example-client-calls)
 - [Data Layout](#data-layout)
+- [Using an Existing `employees.csv`](#using-an-existing-employeescsv)
+- [Mapping an Existing Profile and Ledger](#mapping-an-existing-profile-and-ledger)
 - [PDF and DOCX Reading Behavior](#pdf-and-docx-reading-behavior)
 - [Configuration](#configuration)
 - [Security and Resilience](#security-and-resilience)
@@ -283,6 +285,7 @@ OpenCode only reads its settings at startup, so restart it after editing.
 | `update_company_notes` | Creates or updates a policy, meeting, strategy or vision note. | `note_title`, `content` |
 | `inspect_company_data` | Reports whether each core file matches the expected schema, and why not. | — |
 | `migrate_company_data` | Converts an existing `employees.csv` to the current column schema. | — (`apply` defaults to `false`) |
+| `plan_company_data_migration` | Proposes a field mapping for an existing `company_profile.json` and `financials.json`. Read-only. | — |
 
 All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
 record or a description longer than 2,000 characters is rejected.
@@ -352,10 +355,36 @@ layout; it is a dry run by default and writes a timestamped backup before applyi
 {"tool": "migrate_company_data", "arguments": {"apply": true}}
 ```
 
-`company_profile.json` and `financials.json` are **not** migrated automatically. Their
-real-world variants carry custom fields such as `ARR`, `fiscal_year` or runway metrics,
-and rewriting them would destroy data. `inspect_company_data` reports them as
-`incompatible` so you can decide how to map them.
+## Mapping an Existing Profile and Ledger
+
+`company_profile.json` and `financials.json` are **not** rewritten automatically. Real-world
+variants carry custom fields such as `ARR`, `fiscal_year` or runway metrics, and rewriting
+them would destroy data. `inspect_company_data` reports them as `incompatible`;
+`plan_company_data_migration` goes one step further and produces a read-only proposal.
+
+Nothing is ever written. The report splits every source field into one of these buckets:
+
+| Bucket | Meaning |
+|---|---|
+| `already_valid` | The key and value already satisfy the canonical model and are reused unchanged. |
+| `mappable` | A rule can convert it. `confidence` is `auto` or `needs_confirmation`. |
+| `skipped_conflicts` | Two source fields target the same canonical field; the first one wins. |
+| `incompatible_values` | The value cannot be used as it is, with the reason. |
+| `no_target` | No canonical field exists. Known risky fields such as `pending_invoices_receivable` come with an explanation. |
+| `missing_required` | A required canonical field that no source field provides. |
+
+A proposal is `needs_confirmation` whenever the rule has to **assume or drop something**,
+for example `founded_year: 2023` becoming `established_date: 2023-01-01`, or
+`status: "Active / Series-A Funded"` being narrowed to `active`. Those become explicit
+questions. Cross-file problems are reported separately, such as a ledger with no
+`company_name` or a profile that would silently default to `TRY` while the ledger is `USD`.
+
+`proposed_document` is only included when **no question is open**, so a ready-to-use
+document can never be copied into place unread. The server never applies an exchange rate.
+
+```json
+{"tool": "plan_company_data_migration", "arguments": {}}
+```
 
 ## PDF and DOCX Reading Behavior
 
@@ -464,7 +493,8 @@ the server and validates the tool list with a `tools/list` call. Use
 
 - [x] Automated test suite (`pytest`) and CI workflow
 - [x] Read existing `employees.csv` with common column names; schema inspection and migration
-- [ ] Mapping helper for real-world `company_profile.json` and `financials.json`
+- [x] Read-only mapping proposals for existing `company_profile.json` and `financials.json`
+- [ ] Apply a confirmed `company_profile.json` / `financials.json` mapping with a backup
 - [ ] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
 - [ ] Character budget for `read_company_file` output and PDF page ranges

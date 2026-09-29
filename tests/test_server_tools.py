@@ -112,8 +112,8 @@ def client(data_dir: Path) -> Iterator[StdioClient]:
 
 
 class TestToolRegistration:
-    def test_nine_tools_registered(self) -> None:
-        assert len(mcp._tool_manager.list_tools()) == 9
+    def test_ten_tools_registered(self) -> None:
+        assert len(mcp._tool_manager.list_tools()) == 10
 
     def test_every_tool_has_description(self) -> None:
         for tool in mcp._tool_manager.list_tools():
@@ -131,6 +131,7 @@ class TestToolRegistration:
             "update_company_notes",
             "inspect_company_data",
             "migrate_company_data",
+            "plan_company_data_migration",
         ],
     )
     def test_tool_exists(self, name: str) -> None:
@@ -140,7 +141,7 @@ class TestToolRegistration:
 class TestLiveProtocol:
     def test_initialize_and_list_tools(self, client: StdioClient) -> None:
         tools = client.request("tools/list")["result"]["tools"]
-        assert len(tools) == 9
+        assert len(tools) == 10
         assert {tool["name"] for tool in tools} == {
             "list_company_files",
             "get_company_overview",
@@ -151,6 +152,7 @@ class TestLiveProtocol:
             "update_company_notes",
             "inspect_company_data",
             "migrate_company_data",
+            "plan_company_data_migration",
         }
 
     def test_schemas_expose_required_fields(self, client: StdioClient) -> None:
@@ -385,6 +387,41 @@ class TestLiveProtocol:
         )
         assert "Employee added successfully" in added
         assert "EMP-0102" in added
+
+    def test_plan_reports_missing_files(self, client: StdioClient) -> None:
+        text = client.call("plan_company_data_migration", {})
+        assert '"writes_performed": false' in text
+        assert '"status": "missing"' in text
+
+    def test_plan_is_read_only(self, client: StdioClient, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "company_profile.json").write_text(
+            '{"company_name": "Aetheris", "founded_year": 2023, "sector": "AI"}',
+            encoding="utf-8",
+        )
+        (data_dir / "financials.json").write_text(
+            '{"currency": "USD", "bank_balance": 850000}', encoding="utf-8"
+        )
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        text = client.call("plan_company_data_migration", {})
+        after = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        assert after == before
+        assert '"writes_performed": false' in text
+        assert "established_date" in text
+        assert '"confidence": "needs_confirmation"' in text
+
+    def test_plan_after_init_is_clean(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {
+                "company_name": "Acme",
+                "sector": "Yazilim",
+                "initial_budget": 50_000,
+            },
+        )
+        text = client.call("plan_company_data_migration", {})
+        assert '"blocking_files": []' in text
+        assert '"proposed_document"' in text
 
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})
