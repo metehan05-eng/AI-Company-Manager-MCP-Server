@@ -52,6 +52,41 @@ EMPLOYEE_COLUMNS = [
     "status",
 ]
 
+EMPLOYEE_COLUMN_ALIASES = {
+    "id": "employee_id",
+    "employeeid": "employee_id",
+    "employee_code": "employee_id",
+    "code": "employee_id",
+    "no": "employee_id",
+    "full_name": "name",
+    "fullname": "name",
+    "ad_soyad": "name",
+    "employee_name": "name",
+    "personel_adi": "name",
+    "title": "role",
+    "position": "role",
+    "gorev": "role",
+    "unite": "department",
+    "dept": "department",
+    "team": "department",
+    "bolum": "department",
+    "salary_usd": "salary",
+    "monthly_salary": "salary",
+    "monthly_salary_usd": "salary",
+    "maas": "salary",
+    "ucret": "salary",
+    "start": "start_date",
+    "hire_date": "start_date",
+    "hired_at": "start_date",
+    "ise_giris": "start_date",
+    "employment_status": "status",
+    "state": "status",
+    "durum": "status",
+}
+
+REQUIRED_EMPLOYEE_COLUMNS = ["name", "role", "department", "salary"]
+DEFAULTED_EMPLOYEE_COLUMNS = ["employee_id", "start_date", "status"]
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -100,6 +135,59 @@ def _normalize_categories(value: list[str]) -> list[str]:
     if not normalized:
         raise ValueError("at least one category is required")
     return normalized
+
+
+def _normalize_column_key(column: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+
+
+def _resolve_employee_columns(columns: list[object]) -> dict[object, str]:
+    """Map incoming CSV headers onto the canonical employee schema.
+
+    Unrecognized columns are intentionally left out of the mapping so that
+    caller-defined data such as `performance_score` survives a read/write cycle.
+    """
+    resolved: dict[object, str] = {}
+    for column in columns:
+        key = _normalize_column_key(column)
+        if key in EMPLOYEE_COLUMNS:
+            resolved[column] = key
+            continue
+        alias = EMPLOYEE_COLUMN_ALIASES.get(key)
+        if alias is not None and alias not in resolved.values():
+            resolved[column] = alias
+    return resolved
+
+
+def _default_employee_id(value: object) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"EMP-\d{4,}", text):
+        return text
+    digits = re.findall(r"\d+", text)
+    if digits:
+        return f"EMP-{int(digits[-1]):04d}"
+    return f"EMP-{abs(hash(text)) % 9000 + 1000:04d}"
+
+
+def _default_employee_start_date(value: object) -> str:
+    text = str(value).strip()
+    if not text:
+        return _utc_today().isoformat()
+    for pattern in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return _utc_today().isoformat()
+
+
+def _default_employee_status(value: object) -> str:
+    text = str(value).strip().casefold()
+    if text in {"inactive", "pasif", "left", "terminated", "false", "0", "no"}:
+        return "inactive"
+    return "active"
 
 
 def _normalize_money(value: float | str, field_name: str) -> Decimal:
@@ -479,12 +567,31 @@ class CompanyWizard:
             raise FileNotFoundError(
                 "employees.csv was not found; initialize a company first"
             ) from exc
-        missing_columns = [column for column in EMPLOYEE_COLUMNS if column not in frame.columns]
+
+        mapping = _resolve_employee_columns(list(frame.columns))
+        renamed = frame.rename(columns=mapping)
+        extra_columns = [column for column in renamed.columns if column not in EMPLOYEE_COLUMNS]
+
+        missing_columns = [
+            column for column in REQUIRED_EMPLOYEE_COLUMNS if column not in renamed.columns
+        ]
         if missing_columns:
+            available = ", ".join(str(column) for column in frame.columns)
             raise ValueError(
-                f"employees.csv is missing required columns: {', '.join(missing_columns)}"
+                f"employees.csv is missing required columns: {', '.join(missing_columns)}. "
+                f"Columns found: {available}. "
+                f"Run migrate_company_data to convert an existing file to the current schema."
             )
-        return frame[EMPLOYEE_COLUMNS]
+
+        for defaulted in DEFAULTED_EMPLOYEE_COLUMNS:
+            if defaulted not in renamed.columns:
+                renamed[defaulted] = ""
+
+        ordered = renamed[EMPLOYEE_COLUMNS + extra_columns].copy()
+        ordered["start_date"] = ordered["start_date"].apply(_default_employee_start_date)
+        ordered["status"] = ordered["status"].apply(_default_employee_status)
+        ordered["employee_id"] = ordered["employee_id"].apply(_default_employee_id)
+        return ordered
 
     def add_employee(
         self,
@@ -516,8 +623,12 @@ class CompanyWizard:
             row: dict[str, Any] = employee.model_dump(mode="json")
             row["salary"] = float(salary_value)
             row["start_date"] = employee.start_date.isoformat()
+            new_row = pd.DataFrame([row])
+            for extra_column in frame.columns:
+                if extra_column not in new_row.columns:
+                    new_row[extra_column] = ""
             updated_frame = pd.concat(
-                [frame, pd.DataFrame([row], columns=EMPLOYEE_COLUMNS)],
+                [frame, new_row[frame.columns]],
                 ignore_index=True,
             )
             self.file_handler.write_file("employees.csv", updated_frame)
@@ -526,6 +637,152 @@ class CompanyWizard:
             "message": "Employee added successfully",
             "employee": employee.model_dump(mode="json"),
         }
+
+    def inspect_data_schema(self) -> dict[str, Any]:
+        """Report which company files are readable by the current schema and why not."""
+        report: dict[str, Any] = {"data_directory": str(self.file_handler.data_dir), "files": {}}
+
+        employees_path = self.file_handler.data_dir / "employees.csv"
+        if employees_path.exists():
+            try:
+                frame = self._read_employees()
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                report["files"]["employees.csv"] = {
+                    "status": "incompatible",
+                    "reason": str(exc),
+                }
+            else:
+                extra = [column for column in frame.columns if column not in EMPLOYEE_COLUMNS]
+                report["files"]["employees.csv"] = {
+                    "status": "compatible",
+                    "row_count": len(frame),
+                    "columns": list(frame.columns),
+                    "mapped_columns": {
+                        str(column): canonical
+                        for column, canonical in _resolve_employee_columns(
+                            list(pd.read_csv(employees_path, nrows=0).columns)
+                        ).items()
+                    },
+                    "preserved_extra_columns": extra,
+                }
+        else:
+            report["files"]["employees.csv"] = {
+                "status": "missing",
+                "reason": "employees.csv was not found; initialize a company first",
+            }
+
+        for filename, model_type in (
+            ("company_profile.json", CompanyProfile),
+            ("financials.json", CompanyFinancials),
+        ):
+            if not (self.file_handler.data_dir / filename).exists():
+                report["files"][filename] = {
+                    "status": "missing",
+                    "reason": f"{filename} was not found; initialize a company first",
+                }
+                continue
+            try:
+                self._read_model(filename, model_type)
+            except (FileNotFoundError, ValueError) as exc:
+                report["files"][filename] = {
+                    "status": "incompatible",
+                    "reason": str(exc).splitlines()[0],
+                }
+            else:
+                report["files"][filename] = {"status": "compatible"}
+
+        incompatible = [
+            name for name, info in report["files"].items() if info["status"] != "compatible"
+        ]
+        report["ready_for_tools"] = not incompatible
+        report["blocking_files"] = incompatible
+        return report
+
+    def migrate_company_data(self, apply: bool = False) -> dict[str, Any]:
+        """Convert employees.csv to the canonical schema, with a timestamped backup.
+
+        The call is a dry run unless `apply` is True. Unknown columns are preserved
+        so caller-defined data is never discarded.
+        """
+        employees_path = self.file_handler.data_dir / "employees.csv"
+        if not employees_path.exists():
+            raise FileNotFoundError("employees.csv was not found; initialize a company first")
+
+        try:
+            raw = pd.read_csv(employees_path, dtype=object, keep_default_na=False)
+        except (ValueError, OSError) as exc:
+            raise ValueError(f"employees.csv could not be parsed: {exc}") from exc
+
+        original_columns = [str(column) for column in raw.columns]
+        mapping = _resolve_employee_columns(list(raw.columns))
+        renamed = raw.rename(columns=mapping)
+        extra_columns = [
+            column
+            for column in renamed.columns
+            if column not in EMPLOYEE_COLUMNS and column not in DEFAULTED_EMPLOYEE_COLUMNS
+        ]
+        missing_columns = [
+            column for column in REQUIRED_EMPLOYEE_COLUMNS if column not in renamed.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"employees.csv cannot be migrated automatically: missing "
+                f"{', '.join(missing_columns)}. Add or rename those columns and retry. "
+                f"Columns found: {', '.join(original_columns)}"
+            )
+
+        for defaulted in DEFAULTED_EMPLOYEE_COLUMNS:
+            if defaulted not in renamed.columns:
+                renamed[defaulted] = ""
+
+        columns_need_renaming = any(
+            str(column) != canonical_name for column, canonical_name in mapping.items()
+        )
+        missing_defaults = [
+            column for column in DEFAULTED_EMPLOYEE_COLUMNS if column not in raw.columns
+        ]
+
+        if not columns_need_renaming and not extra_columns and not missing_defaults:
+            return {
+                "message": "employees.csv already uses the current schema; no changes needed",
+                "changed": False,
+                "row_count": len(raw),
+                "columns": original_columns,
+            }
+
+        canonical = renamed[EMPLOYEE_COLUMNS + extra_columns].copy()
+        canonical["start_date"] = canonical["start_date"].apply(_default_employee_start_date)
+        canonical["status"] = canonical["status"].apply(_default_employee_status)
+        canonical["employee_id"] = canonical["employee_id"].apply(_default_employee_id)
+
+        result: dict[str, Any] = {
+            "changed": True,
+            "applied": apply,
+            "row_count": len(canonical),
+            "columns_before": original_columns,
+            "columns_after": [str(column) for column in canonical.columns],
+            "renamed_columns": {
+                str(column): canonical_name for column, canonical_name in mapping.items()
+            },
+            "preserved_extra_columns": [str(column) for column in extra_columns],
+        }
+
+        if not apply:
+            result["message"] = (
+                "Dry run only. Re-run with apply=True to write the migrated file. "
+                "The original file is backed up before writing."
+            )
+            return result
+
+        stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        backup_name = f"employees.backup-{stamp}.csv"
+        self.file_handler.write_file(backup_name, raw)
+        self.file_handler.write_file("employees.csv", canonical)
+        result["applied"] = True
+        result["backup_file"] = backup_name
+        result["message"] = "employees.csv migrated successfully"
+        return result
 
     def update_company_notes(self, note_title: str, content: str) -> dict[str, Any]:
         title = _clean_required_text(note_title, "note_title")

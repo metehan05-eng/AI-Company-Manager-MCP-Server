@@ -9,8 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `inspect_company_data` tool: reports whether each core file matches the expected
+  schema, which columns were mapped, and which files still block the other tools.
+- `migrate_company_data` tool: rewrites an existing `employees.csv` in the canonical
+  column layout. Dry run by default; applies with a timestamped backup.
+- Flexible `employees.csv` reading: common alternative column names (`id`,
+  `full_name`, `monthly_salary_usd`, `hire_date`, `durum`, and others) are mapped to
+  the canonical schema. Unrecognized columns such as `performance_score` are preserved
+  across reads and writes instead of being dropped.
+- Automatic defaults for absent `employee_id`, `start_date` and `status`; `start_date`
+  accepts `YYYY-MM-DD`, `DD.MM.YYYY` and `DD/MM/YYYY`.
+- Actionable error messages that list the columns actually found and point to
+  `migrate_company_data`.
+
+### Not changed
+
+- `company_profile.json` and `financials.json` are still not auto-migrated. Real-world
+  variants carry custom fields (`ARR`, `fiscal_year`, runway) that cannot be mapped
+  without losing data, so `inspect_company_data` reports them as `incompatible` and
+  leaves the decision to the user.
+
+### Planned
+
 - `get_financial_report`, `update_employee`, `delete_financial_record`, and
-  `list_notes` tools (planned)
+  `list_notes` tools
 
 ## [0.2.0] - 2026-09-29
 

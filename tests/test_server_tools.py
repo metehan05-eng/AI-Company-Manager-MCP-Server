@@ -112,8 +112,8 @@ def client(data_dir: Path) -> Iterator[StdioClient]:
 
 
 class TestToolRegistration:
-    def test_seven_tools_registered(self) -> None:
-        assert len(mcp._tool_manager.list_tools()) == 7
+    def test_nine_tools_registered(self) -> None:
+        assert len(mcp._tool_manager.list_tools()) == 9
 
     def test_every_tool_has_description(self) -> None:
         for tool in mcp._tool_manager.list_tools():
@@ -129,6 +129,8 @@ class TestToolRegistration:
             "add_financial_record",
             "add_employee",
             "update_company_notes",
+            "inspect_company_data",
+            "migrate_company_data",
         ],
     )
     def test_tool_exists(self, name: str) -> None:
@@ -138,7 +140,7 @@ class TestToolRegistration:
 class TestLiveProtocol:
     def test_initialize_and_list_tools(self, client: StdioClient) -> None:
         tools = client.request("tools/list")["result"]["tools"]
-        assert len(tools) == 7
+        assert len(tools) == 9
         assert {tool["name"] for tool in tools} == {
             "list_company_files",
             "get_company_overview",
@@ -147,6 +149,8 @@ class TestLiveProtocol:
             "add_financial_record",
             "add_employee",
             "update_company_notes",
+            "inspect_company_data",
+            "migrate_company_data",
         }
 
     def test_schemas_expose_required_fields(self, client: StdioClient) -> None:
@@ -297,6 +301,90 @@ class TestLiveProtocol:
         )
         text = client.call("read_company_file", {"filename": "yok.csv"})
         assert "not found" in text.lower()
+
+    def test_inspect_reports_missing_files(self, client: StdioClient) -> None:
+        text = client.call("inspect_company_data", {})
+        assert '"ready_for_tools": false' in text
+        assert "employees.csv" in text
+
+    def test_inspect_after_init(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {
+                "company_name": "Acme",
+                "sector": "Yazilim",
+                "initial_budget": 50_000,
+                "vision": "v",
+                "mission": "m",
+            },
+        )
+        text = client.call("inspect_company_data", {})
+        assert '"ready_for_tools": true' in text
+
+    def test_migrate_defaults_to_dry_run(self, client: StdioClient) -> None:
+        text = client.call("migrate_company_data", {})
+        assert "was not found" in text.lower()
+
+    def test_migrate_reports_no_change_for_canonical_file(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {
+                "company_name": "Acme",
+                "sector": "Yazilim",
+                "initial_budget": 50_000,
+                "vision": "v",
+                "mission": "m",
+            },
+        )
+        text = client.call("migrate_company_data", {})
+        assert "already uses the current schema" in text
+        assert '"changed": false' in text
+
+    def test_migrate_apply_false_does_not_write(self, client: StdioClient, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "id,full_name,role,department,monthly_salary_usd\nE101,Ali,Dev,Ar-Ge,8500\n",
+            encoding="utf-8",
+        )
+        before = (data_dir / "employees.csv").read_text(encoding="utf-8")
+        text = client.call("migrate_company_data", {})
+        assert '"applied": false' in text
+        assert '"renamed_columns"' in text
+        assert (data_dir / "employees.csv").read_text(encoding="utf-8") == before
+        assert not list(data_dir.glob("employees.backup-*.csv"))
+
+    def test_migrate_apply_writes_canonical_schema(
+        self, client: StdioClient, data_dir: Path
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        original = (
+            "id,full_name,role,department,monthly_salary_usd,performance_score\n"
+            "E101,Ali,Dev,Ar-Ge,8500,4.9\n"
+        )
+        (data_dir / "employees.csv").write_text(original, encoding="utf-8")
+        text = client.call("migrate_company_data", {"apply": True})
+        assert '"applied": true' in text
+        assert "migrated successfully" in text
+        header = (data_dir / "employees.csv").read_text(encoding="utf-8-sig").split("\n")[0]
+        assert header.startswith("employee_id,name,role,department,salary")
+        assert "performance_score" in header
+        backups = list(data_dir.glob("employees.backup-*.csv"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == original
+
+    def test_migrate_then_add_employee(self, client: StdioClient, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "id,full_name,role,department,monthly_salary_usd\nE101,Ali,Dev,Ar-Ge,8500\n",
+            encoding="utf-8",
+        )
+        client.call("migrate_company_data", {"apply": True})
+        added = client.call(
+            "add_employee",
+            {"name": "Probe", "role": "QA", "department": "Ar-Ge", "salary": 1000},
+        )
+        assert "Employee added successfully" in added
+        assert "EMP-0102" in added
 
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})

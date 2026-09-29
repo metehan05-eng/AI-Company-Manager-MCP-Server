@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from src.company_wizard import CompanyWizard
@@ -189,7 +191,250 @@ class TestEmployees:
         )
         with pytest.raises(ValueError) as excinfo:
             wizard.add_employee("Ayse", "Mudur", "IT", 1_000.0)
-        assert "missing required columns" in str(excinfo.value)
+        assert "missing required columns: role, department" in str(excinfo.value)
+
+    def test_error_lists_columns_found(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        wizard.init_company("Acme", "Yazilim", 10_000.0)
+        (data_dir / "employees.csv").write_text("id,full_name\n1,Ali\n", encoding="utf-8")
+        with pytest.raises(ValueError) as excinfo:
+            wizard.add_employee("Ayse", "Mudur", "IT", 1_000.0)
+        assert "Columns found: id, full_name" in str(excinfo.value)
+        assert "migrate_company_data" in str(excinfo.value)
+
+
+class TestLegacyEmployeeSchema:
+    """A real-world employees.csv used different column names and must stay usable."""
+
+    LEGACY = (
+        "id,full_name,role,department,monthly_salary_usd,performance_score\n"
+        "E101,Metehan Erbasc,CTO,Ar-Ge,8500,4.9\n"
+        "E102,Zeynep Sahin,Lead AI Engineer,Ar-Ge,5200,4.8\n"
+    )
+
+    def _write_legacy(self, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(self.LEGACY, encoding="utf-8")
+
+    def test_legacy_columns_are_readable(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write_legacy(data_dir)
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0101", "EMP-0102"]
+        assert list(frame["name"]) == ["Metehan Erbasc", "Zeynep Sahin"]
+        assert list(frame["salary"]) == ["8500", "5200"]
+
+    def test_extra_columns_are_preserved(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write_legacy(data_dir)
+        frame = wizard._read_employees()
+        assert "performance_score" in frame.columns
+        assert list(frame["performance_score"]) == ["4.9", "4.8"]
+
+    def test_add_employee_works_on_legacy_file(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write_legacy(data_dir)
+        result = wizard.add_employee("Probe", "QA", "Ar-Ge", 1_000.0)
+        assert result["employee"]["employee_id"] == "EMP-0103"
+        content = (data_dir / "employees.csv").read_text(encoding="utf-8-sig")
+        assert "performance_score" in content
+        assert "4.9" in content
+        assert "EMP-0101" in content
+
+    def test_new_row_fills_extra_columns_with_blank(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write_legacy(data_dir)
+        wizard.add_employee("Probe", "QA", "Ar-Ge", 1_000.0)
+        lines = (data_dir / "employees.csv").read_text(encoding="utf-8-sig").strip().split("\n")
+        assert lines[0].endswith("performance_score")
+        assert lines[-1].endswith(",")
+
+    def test_missing_start_date_defaults_to_today(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write_legacy(data_dir)
+        frame = wizard._read_employees()
+        today = date.today().isoformat()
+        assert list(frame["start_date"]) == [today, today]
+
+    def test_missing_status_defaults_to_active(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write_legacy(data_dir)
+        frame = wizard._read_employees()
+        assert list(frame["status"]) == ["active", "active"]
+
+    @pytest.mark.parametrize(
+        ("header", "value", "expected"),
+        [
+            ("status", "Inactive", "inactive"),
+            ("status", "pasif", "inactive"),
+            ("durum", "Pasif", "inactive"),
+            ("status", "Active", "active"),
+            ("status", "", "active"),
+        ],
+    )
+    def test_status_variants(
+        self, wizard: CompanyWizard, data_dir: Path, header: str, value: str, expected: str
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            f"id,full_name,role,department,monthly_salary_usd,{header}\n"
+            f"E101,Ali,Dev,Ar-Ge,1000,{value}\n",
+            encoding="utf-8",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["status"]) == [expected]
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("2024-03-15", "2024-03-15"),
+            ("15.03.2024", "2024-03-15"),
+            ("15/03/2024", "2024-03-15"),
+            ("", date.today().isoformat()),
+        ],
+    )
+    def test_start_date_formats(
+        self, wizard: CompanyWizard, data_dir: Path, value: str, expected: str
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "id,full_name,role,department,monthly_salary_usd,start_date\n"
+            f"E101,Ali,Dev,Ar-Ge,1000,{value}\n",
+            encoding="utf-8",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["start_date"]) == [expected]
+
+    def test_canonical_file_still_works(self, company: CompanyWizard) -> None:
+        frame = company._read_employees()
+        assert "employee_id" in frame.columns
+        assert "EMP-0001" in list(frame["employee_id"])
+
+
+class TestInspectDataSchema:
+    def test_reports_all_files(self, company: CompanyWizard) -> None:
+        report = company.inspect_data_schema()
+        assert set(report["files"]) == {
+            "employees.csv",
+            "company_profile.json",
+            "financials.json",
+        }
+        assert report["ready_for_tools"] is True
+        assert report["blocking_files"] == []
+
+    def test_reports_missing_files(self, wizard: CompanyWizard) -> None:
+        report = wizard.inspect_data_schema()
+        assert report["ready_for_tools"] is False
+        assert set(report["blocking_files"]) == {
+            "employees.csv",
+            "company_profile.json",
+            "financials.json",
+        }
+        assert report["files"]["employees.csv"]["status"] == "missing"
+
+    def test_legacy_file_reported_compatible_with_mapping(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        report = wizard.inspect_data_schema()
+        info = report["files"]["employees.csv"]
+        assert info["status"] == "compatible"
+        assert info["row_count"] == 2
+        assert info["mapped_columns"]["full_name"] == "name"
+        assert info["mapped_columns"]["monthly_salary_usd"] == "salary"
+        assert info["preserved_extra_columns"] == ["performance_score"]
+
+    def test_incompatible_file_reports_reason(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        wizard.init_company("Acme", "Yazilim", 1_000.0)
+        (data_dir / "employees.csv").write_text("id,full_name\n1,Ali\n", encoding="utf-8")
+        report = wizard.inspect_data_schema()
+        assert report["files"]["employees.csv"]["status"] == "incompatible"
+        assert "missing required columns" in report["files"]["employees.csv"]["reason"]
+
+    def test_incompatible_json_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "company_profile.json").write_text(
+            '{"company_name": "Aetheris", "founded_year": 2023}', encoding="utf-8"
+        )
+        report = wizard.inspect_data_schema()
+        assert report["files"]["company_profile.json"]["status"] == "incompatible"
+        assert "validation errors" in report["files"]["company_profile.json"]["reason"]
+
+
+class TestMigrateCompanyData:
+    def test_dry_run_does_not_write(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        result = wizard.migrate_company_data()
+        assert result["applied"] is False
+        assert result["changed"] is True
+        assert "Dry run" in result["message"]
+        assert (data_dir / "employees.csv").read_text(encoding="utf-8") == (
+            TestLegacyEmployeeSchema.LEGACY
+        )
+        assert not list(data_dir.glob("employees.backup-*.csv"))
+
+    def test_dry_run_reports_planned_changes(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        result = wizard.migrate_company_data()
+        assert result["renamed_columns"]["id"] == "employee_id"
+        assert result["renamed_columns"]["full_name"] == "name"
+        assert result["preserved_extra_columns"] == ["performance_score"]
+        assert "performance_score" in result["columns_after"]
+        assert "start_date" in result["columns_after"]
+        assert result["row_count"] == 2
+
+    def test_apply_writes_canonical_schema(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        result = wizard.migrate_company_data(apply=True)
+        assert result["applied"] is True
+        header = (data_dir / "employees.csv").read_text(encoding="utf-8-sig").split("\n")[0]
+        assert header == (
+            "employee_id,name,role,department,salary,start_date,status,performance_score"
+        )
+
+    def test_apply_creates_backup(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        result = wizard.migrate_company_data(apply=True)
+        backups = list(data_dir.glob("employees.backup-*.csv"))
+        assert len(backups) == 1
+        assert result["backup_file"] == backups[0].name
+        assert backups[0].read_text(encoding="utf-8") == TestLegacyEmployeeSchema.LEGACY
+
+    def test_apply_preserves_row_data(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        wizard.migrate_company_data(apply=True)
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        assert list(frame["employee_id"]) == ["EMP-0101", "EMP-0102"]
+        assert list(frame["name"]) == ["Metehan Erbasc", "Zeynep Sahin"]
+        assert list(frame["salary"]) == ["8500", "5200"]
+        assert list(frame["performance_score"]) == ["4.9", "4.8"]
+
+    def test_canonical_file_needs_no_migration(self, company: CompanyWizard) -> None:
+        result = company.migrate_company_data()
+        assert result["changed"] is False
+        assert "already uses the current schema" in result["message"]
+
+    def test_unmigratable_file_rejected(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text("id,full_name\n1,Ali\n", encoding="utf-8")
+        with pytest.raises(ValueError) as excinfo:
+            wizard.migrate_company_data(apply=True)
+        assert "cannot be migrated automatically" in str(excinfo.value)
+        assert (data_dir / "employees.csv").read_text(encoding="utf-8") == "id,full_name\n1,Ali\n"
+
+    def test_missing_file(self, wizard: CompanyWizard) -> None:
+        with pytest.raises(FileNotFoundError):
+            wizard.migrate_company_data(apply=True)
+
+    def test_migrated_file_is_then_writable(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(TestLegacyEmployeeSchema.LEGACY, encoding="utf-8")
+        wizard.migrate_company_data(apply=True)
+        result = wizard.add_employee("Probe", "QA", "Ar-Ge", 1_000.0)
+        assert result["employee"]["employee_id"] == "EMP-0103"
 
 
 class TestNotes:

@@ -119,6 +119,25 @@ def add_employee(
 
 @mcp.tool()
 @readable_errors
+def inspect_company_data() -> dict[str, Any]:
+    """Check whether the files in company_data match the schema the tools expect."""
+    return company_wizard.inspect_data_schema()
+
+
+@mcp.tool()
+@readable_errors
+def migrate_company_data(apply: bool = False) -> dict[str, Any]:
+    """Convert an existing employees.csv to the current column schema.
+
+    Runs as a dry run by default. With apply=True it renames the known columns,
+    fills in start_date/status defaults, keeps unknown columns such as
+    performance_score, and writes a timestamped backup first.
+    """
+    return company_wizard.migrate_company_data(apply=apply)
+
+
+@mcp.tool()
+@readable_errors
 def update_company_notes(
     note_title: Annotated[str, Field(min_length=1, max_length=200)],
     content: Annotated[str, Field(min_length=1, max_length=100_000)],

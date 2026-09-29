@@ -281,6 +281,8 @@ OpenCode only reads its settings at startup, so restart it after editing.
 | `add_financial_record` | Appends an `income` or `expense` transaction to `financials.json`. | `type`, `category`, `amount`, `description` |
 | `add_employee` | Appends a validated employee record to `employees.csv`. | `name`, `role`, `department`, `salary` |
 | `update_company_notes` | Creates or updates a policy, meeting, strategy or vision note. | `note_title`, `content` |
+| `inspect_company_data` | Reports whether each core file matches the expected schema, and why not. | — |
+| `migrate_company_data` | Converts an existing `employees.csv` to the current column schema. | — (`apply` defaults to `false`) |
 
 All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
 record or a description longer than 2,000 characters is rejected.
@@ -318,6 +320,42 @@ so that data cannot be lost. Back up the core files before starting another comp
 
 You can drop your own TXT, MD, JSON, CSV, XLSX, PDF or DOCX documents into `company_data/`;
 `read_company_file` reads them.
+
+## Using an Existing `employees.csv`
+
+If you already have an `employees.csv` from another system, the tools understand common
+column names instead of demanding the exact current schema.
+
+| Current column | Also accepted as |
+|---|---|
+| `employee_id` | `id`, `employee_code`, `code`, `no` |
+| `name` | `full_name`, `fullname`, `ad_soyad`, `employee_name`, `personel_adi` |
+| `role` | `title`, `position`, `gorev` |
+| `department` | `dept`, `unite`, `team`, `bolum` |
+| `salary` | `monthly_salary`, `monthly_salary_usd`, `salary_usd`, `maas`, `ucret` |
+| `start_date` | `hire_date`, `hired_at`, `ise_giris`, `start` |
+| `status` | `employment_status`, `state`, `durum` |
+
+Only `name`, `role`, `department` and `salary` are strictly required. Missing
+`employee_id`, `start_date` and `status` are filled in automatically, dates accept
+`YYYY-MM-DD`, `DD.MM.YYYY` and `DD/MM/YYYY`, and any status other than a recognized
+"inactive" value is treated as `active`. Columns the tools do not recognize, such as
+`performance_score`, are **preserved** on read and on every subsequent write.
+
+Use `inspect_company_data` to see which files match the schema and what is blocking the
+others. Use `migrate_company_data` to permanently rewrite `employees.csv` in the canonical
+layout; it is a dry run by default and writes a timestamped backup before applying.
+
+```json
+{"tool": "inspect_company_data", "arguments": {}}
+{"tool": "migrate_company_data", "arguments": {}}
+{"tool": "migrate_company_data", "arguments": {"apply": true}}
+```
+
+`company_profile.json` and `financials.json` are **not** migrated automatically. Their
+real-world variants carry custom fields such as `ARR`, `fiscal_year` or runway metrics,
+and rewriting them would destroy data. `inspect_company_data` reports them as
+`incompatible` so you can decide how to map them.
 
 ## PDF and DOCX Reading Behavior
 
@@ -425,6 +463,8 @@ the server and validates the tool list with a `tools/list` call. Use
 ## Roadmap
 
 - [x] Automated test suite (`pytest`) and CI workflow
+- [x] Read existing `employees.csv` with common column names; schema inspection and migration
+- [ ] Mapping helper for real-world `company_profile.json` and `financials.json`
 - [ ] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
 - [ ] Character budget for `read_company_file` output and PDF page ranges
