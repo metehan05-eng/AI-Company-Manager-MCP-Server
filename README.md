@@ -373,41 +373,78 @@ AI-Company-Manager-MCP-Server/
 
 ## Development
 
-Code style and type checks:
+Set up an editable install with the development extras:
 
 ```bash
-ruff check src install.py
-ruff format --check src install.py
-mypy --python-version 3.10 --ignore-missing-imports src install.py
+git clone https://github.com/metehan05-eng/AI-Company-Manager-MCP-Server.git
+cd AI-Company-Manager-MCP-Server
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python -m pip install -e ".[dev]"
 ```
 
-Verify a change against a live server:
+Code style, type checks, and tests:
 
 ```bash
-python3 install.py
+ruff format --check --no-cache src tests install.py
+ruff check --no-cache src tests install.py
+mypy --python-version 3.10 src install.py
+pytest
 ```
 
-This writes the configuration, starts the server and validates the tool list with a `tools/list`
-call. Use `python3 install.py --skip-deps` to only rewrite the configuration, and
+With coverage:
+
+```bash
+pytest --cov=src --cov-report=term-missing
+```
+
+Tests never touch your real `company_data` directory: every test runs in its own
+temporary directory, and `tests/test_repository.py` fails the build if real company
+data or secrets are ever committed.
+
+Verify a change against a live server without modifying anything:
+
+```bash
+python3 install.py --check          # dependency check plus tools/list handshake
+```
+
+To actually install, run `python3 install.py`. This writes the configuration, starts
+the server and validates the tool list with a `tools/list` call. Use
+`python3 install.py --skip-deps` to only rewrite the configuration, and
 `mcp dev src/server.py` for interactive testing with MCP Inspector.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- `ruff` lint and format check, `mypy` type check
+- `pytest` with coverage on Ubuntu, Windows, and macOS across Python 3.10-3.13
+- Installer smoke test (`install.py --check`) on all three operating systems
 
 ## Roadmap
 
-- [ ] Automated test suite (`pytest`) and CI workflow
+- [x] Automated test suite (`pytest`) and CI workflow
 - [ ] Period breakdown table for budget and cash flow
+- [ ] Update and delete operations for financial records and employees
+- [ ] Character budget for `read_company_file` output and PDF page ranges
 - [ ] Excel/PPTX reading support
 - [ ] Support for multiple company data directories
 - [ ] Backup/archive tool
 
 ## Contributing
 
-Contributions are welcome. To start small:
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow
+and house rules, [CHANGELOG.md](CHANGELOG.md) for the release history, and
+[SECURITY.md](SECURITY.md) for reporting a vulnerability privately.
 
-1. Fork the repository.
-2. Create a branch (`git switch -c feature/my-feature`).
-3. Make your change and run the `ruff` and `mypy` checks.
-4. Update the documentation in this README if behavior changed.
-5. Open a pull request and briefly describe what you changed and why.
+In short: fork, branch, make the change, then make sure these four commands pass
+before opening a pull request.
+
+```bash
+ruff format --check --no-cache src tests install.py && ruff check --no-cache src tests install.py
+mypy --python-version 3.10 src install.py && pytest
+```
 
 When you add a new MCP tool, remember to update its docstring in `src/server.py`; that text is sent
 to clients as the tool description.

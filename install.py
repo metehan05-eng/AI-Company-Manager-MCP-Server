@@ -202,9 +202,7 @@ def write_configs(include_global: bool) -> None:
         say(f"  Claude Desktop yapilandirmasi bulunamadi, atlandi: {claude_config}")
 
 
-def await_response(
-    responses: queue.Queue[str], request_id: int, timeout: float
-) -> dict[str, Any]:
+def await_response(responses: queue.Queue[str], request_id: int, timeout: float) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -290,6 +288,40 @@ def verify_server(timeout: float = 90.0) -> int:
             process.kill()
 
 
+def check_environment() -> int:
+    python = venv_python()
+    if not python.exists():
+        say(f"Sanal ortam bulunamadi: {python}")
+        say("Once 'python install.py' calistirin.")
+        return 1
+
+    required = ("mcp", "pydantic", "pandas", "openpyxl", "pypdf", "docx")
+    probe = (
+        "import importlib.util\n"
+        f"missing = [name for name in {required!r} "
+        "if importlib.util.find_spec(name) is None]\n"
+        "print('|'.join(missing))\n"
+    )
+    result = subprocess.run(
+        [str(python), "-c", probe],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        say(f"Bagimlilik kontrolu basarisiz: {result.stderr.strip()}")
+        return 1
+    missing = [item for item in result.stdout.strip().split("|") if item]
+    if missing:
+        say(f"Eksik bagimliliklar: {', '.join(missing)}")
+        return 1
+    say("  tum bagimliliklar hazir")
+
+    say("Sunucu dogrulaniyor...")
+    return verify_server()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="AI Company Manager MCP kurulumu (Windows, Linux, macOS)."
@@ -314,7 +346,20 @@ def main() -> int:
         action="store_true",
         help="Kurulum sonrasi canli sunucu dogrulamasini atla.",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Ortami degistirmeden yalnizca bagimliliklari ve sunucuyu dogrula.",
+    )
     arguments = parser.parse_args()
+
+    if arguments.check:
+        started = time.monotonic()
+        say(f"AI Company Manager MCP kontrolu ({sys.platform})")
+        status = check_environment()
+        elapsed = time.monotonic() - started
+        say(f"Kontrol bitti ({elapsed:.1f} saniye).")
+        return status
 
     started = time.monotonic()
     say(f"AI Company Manager MCP kurulumu ({sys.platform})")

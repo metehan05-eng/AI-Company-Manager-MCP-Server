@@ -16,9 +16,7 @@ import pandas as pd
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SUPPORTED_EXTENSIONS = frozenset(
-    {".txt", ".md", ".json", ".csv", ".xlsx", ".pdf", ".docx"}
-)
+SUPPORTED_EXTENSIONS = frozenset({".txt", ".md", ".json", ".csv", ".xlsx", ".pdf", ".docx"})
 TEXT_EXTENSIONS = frozenset({".txt", ".md"})
 
 
@@ -126,8 +124,7 @@ def _read_pdf(path: Path) -> str:
                     sections.append(f"--- Sayfa {page_number} ---\n{page_text}")
                 else:
                     sections.append(
-                        f"--- Sayfa {page_number} ---\n"
-                        "[Bu sayfada metin içeriği bulunamadı.]"
+                        f"--- Sayfa {page_number} ---\n[Bu sayfada metin içeriği bulunamadı.]"
                     )
     except CompanyFileError:
         raise
@@ -147,8 +144,7 @@ def _read_docx(path: Path) -> str:
         from docx import Document
     except ImportError as exc:
         raise CompanyFileError(
-            "Word support requires python-docx. Install it with: "
-            'pip install "python-docx>=0.8.11"'
+            'Word support requires python-docx. Install it with: pip install "python-docx>=0.8.11"'
         ) from exc
 
     try:
@@ -157,9 +153,7 @@ def _read_docx(path: Path) -> str:
         raise CompanyFileError(f"Word belgesi okunamadı: {exc}") from exc
 
     sections = [
-        paragraph.text.strip()
-        for paragraph in document.paragraphs
-        if paragraph.text.strip()
+        paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()
     ]
     for table_number, table in enumerate(document.tables, start=1):
         sections.append(f"--- Tablo {table_number} ---")
@@ -183,9 +177,7 @@ class FileHandler:
     ) -> None:
         configured_dir = data_dir or os.getenv("COMPANY_DATA_DIR")
         raw_dir = (
-            Path(configured_dir).expanduser()
-            if configured_dir
-            else PROJECT_ROOT / "company_data"
+            Path(configured_dir).expanduser() if configured_dir else PROJECT_ROOT / "company_data"
         )
         if not raw_dir.is_absolute():
             raw_dir = PROJECT_ROOT / raw_dir
@@ -238,9 +230,7 @@ class FileHandler:
         if not self.data_dir.exists():
             return files
 
-        for root, directory_names, filenames in os.walk(
-            self.data_dir, followlinks=False
-        ):
+        for root, directory_names, filenames in os.walk(self.data_dir, followlinks=False):
             root_path = Path(root)
             directory_names[:] = sorted(
                 name for name in directory_names if not (root_path / name).is_symlink()
@@ -326,9 +316,7 @@ class FileHandler:
                         dtype=object,
                         keep_default_na=False,
                     )
-                    csv_text = frame.to_csv(index=False, lineterminator="\n").rstrip(
-                        "\n"
-                    )
+                    csv_text = frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
                     sections.append(f"## {sheet_name}\n{csv_text}")
             return "\n\n".join(sections)
         if extension == ".pdf":
@@ -392,13 +380,9 @@ class FileHandler:
             if isinstance(content, (Mapping, list)):
                 frame = pd.DataFrame(content)
                 return (
-                    _safe_dataframe(frame)
-                    .to_csv(index=False, lineterminator="\n")
-                    .encode("utf-8")
+                    _safe_dataframe(frame).to_csv(index=False, lineterminator="\n").encode("utf-8")
                 )
-            raise TypeError(
-                "CSV content must be text, a DataFrame, a mapping, or a list"
-            )
+            raise TypeError("CSV content must be text, a DataFrame, a mapping, or a list")
 
         if extension == ".xlsx":
             if isinstance(content, pd.DataFrame):
@@ -420,9 +404,7 @@ class FileHandler:
                     elif isinstance(sheet_content, (Mapping, list)):
                         frame = pd.DataFrame(sheet_content)
                     else:
-                        raise TypeError(
-                            f"worksheet '{sheet_name}' must contain tabular data"
-                        )
+                        raise TypeError(f"worksheet '{sheet_name}' must contain tabular data")
                     _safe_dataframe(frame).to_excel(
                         writer,
                         sheet_name=sheet_name,

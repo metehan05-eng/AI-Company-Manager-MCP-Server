@@ -127,5 +127,9 @@ def update_company_notes(
     return company_wizard.update_company_notes(note_title, content)
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

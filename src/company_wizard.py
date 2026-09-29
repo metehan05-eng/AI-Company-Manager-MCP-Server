@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -110,9 +111,7 @@ def _normalize_money(value: float | str, field_name: str) -> Decimal:
         raise ValueError(f"{field_name} must be a finite number")
     exponent = amount.as_tuple().exponent
     if isinstance(exponent, int) and exponent < -2:
-        raise ValueError(
-            f"{field_name} must have at most 2 decimal places (received {value})"
-        )
+        raise ValueError(f"{field_name} must have at most 2 decimal places (received {value})")
     return amount
 
 
@@ -183,12 +182,8 @@ class CompanyFinancials(BaseModel):
     currency: str = Field(default="TRY", min_length=3, max_length=3)
     initial_budget: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
     opening_balance: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
-    revenue_categories: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_REVENUE_CATEGORIES)
-    )
-    expense_categories: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_EXPENSE_CATEGORIES)
-    )
+    revenue_categories: list[str] = Field(default_factory=lambda: list(DEFAULT_REVENUE_CATEGORIES))
+    expense_categories: list[str] = Field(default_factory=lambda: list(DEFAULT_EXPENSE_CATEGORIES))
     records: list[FinancialRecord] = Field(default_factory=list)
     cash_flow_template: list[CashFlowTemplateEntry] = Field(default_factory=list)
     status: CompanyStatus = "active"
@@ -317,9 +312,7 @@ class CompanyWizard:
         employees_path = self.file_handler.data_dir / "employees.csv"
         if employees_path.exists():
             return False
-        existing_paths = [
-            path for path in (profile_path, financials_path) if path.exists()
-        ]
+        existing_paths = [path for path in (profile_path, financials_path) if path.exists()]
         if not existing_paths:
             return True
         try:
@@ -333,9 +326,7 @@ class CompanyWizard:
             and not financials.records
         )
 
-    def init_company(
-        self, company_name: str, sector: str, budget: float
-    ) -> dict[str, Any]:
+    def init_company(self, company_name: str, sector: str, budget: float) -> dict[str, Any]:
         clean_company_name = _clean_required_text(company_name, "company_name")
         clean_sector = _clean_required_text(sector, "sector")
         timestamp = _utc_now()
@@ -412,12 +403,8 @@ class CompanyWizard:
             except Exception:
                 for filename in core_files:
                     if filename in existing_contents:
-                        try:
-                            self.file_handler.write_file(
-                                filename, existing_contents[filename]
-                            )
-                        except (OSError, TypeError, ValueError):
-                            pass
+                        with contextlib.suppress(OSError, TypeError, ValueError):
+                            self.file_handler.write_file(filename, existing_contents[filename])
                     else:
                         (self.file_handler.data_dir / filename).unlink(missing_ok=True)
                 raise
@@ -469,9 +456,7 @@ class CompanyWizard:
                 categories = financials.revenue_categories
             else:
                 categories = financials.expense_categories
-            if not any(
-                item.casefold() == record.category.casefold() for item in categories
-            ):
+            if not any(item.casefold() == record.category.casefold() for item in categories):
                 categories.append(record.category)
             financials.records.append(record)
             financials.updated_at = _utc_now()
@@ -494,9 +479,7 @@ class CompanyWizard:
             raise FileNotFoundError(
                 "employees.csv was not found; initialize a company first"
             ) from exc
-        missing_columns = [
-            column for column in EMPLOYEE_COLUMNS if column not in frame.columns
-        ]
+        missing_columns = [column for column in EMPLOYEE_COLUMNS if column not in frame.columns]
         if missing_columns:
             raise ValueError(
                 f"employees.csv is missing required columns: {', '.join(missing_columns)}"
@@ -553,11 +536,7 @@ class CompanyWizard:
             except FileNotFoundError:
                 notes = CompanyNotes()
             existing_note = next(
-                (
-                    note
-                    for note in notes.notes
-                    if note.title.casefold() == title.casefold()
-                ),
+                (note for note in notes.notes if note.title.casefold() == title.casefold()),
                 None,
             )
             if existing_note is None:
@@ -582,9 +561,7 @@ class CompanyWizard:
             profile = self._read_model("company_profile.json", CompanyProfile)
             financials = self._read_model("financials.json", CompanyFinancials)
         if profile.company_name != financials.company_name:
-            raise ValueError(
-                "company name mismatch between profile and financial files"
-            )
+            raise ValueError("company name mismatch between profile and financial files")
         return {
             "company": {
                 "name": profile.company_name,
@@ -618,9 +595,7 @@ def add_financial_record(
     amount: float,
     description: str,
 ) -> dict[str, Any]:
-    return default_company_wizard.add_financial_record(
-        type, category, amount, description
-    )
+    return default_company_wizard.add_financial_record(type, category, amount, description)
 
 
 def add_employee(
