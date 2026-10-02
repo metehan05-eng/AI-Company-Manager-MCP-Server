@@ -65,6 +65,15 @@ def get_company_overview() -> dict[str, Any]:
 
 @mcp.tool()
 @readable_errors
+def get_financial_report(
+    period: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
+) -> dict[str, Any]:
+    """Report ledger totals, income and expense splits by category, and cash flow periods."""
+    return company_wizard.get_financial_report(period)
+
+
+@mcp.tool()
+@readable_errors
 def read_company_file(filename: str) -> dict[str, Any]:
     """Read a supported company TXT, MD, JSON, CSV, XLSX, PDF, or DOCX file as text."""
     relative_path, path = file_handler.resolve_path(filename)

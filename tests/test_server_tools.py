@@ -159,8 +159,8 @@ def client(data_dir: Path) -> Iterator[StdioClient]:
 
 
 class TestToolRegistration:
-    def test_eleven_tools_registered(self) -> None:
-        assert len(mcp._tool_manager.list_tools()) == 11
+    def test_twelve_tools_registered(self) -> None:
+        assert len(mcp._tool_manager.list_tools()) == 12
 
     def test_every_tool_has_description(self) -> None:
         for tool in mcp._tool_manager.list_tools():
@@ -171,6 +171,7 @@ class TestToolRegistration:
         [
             "list_company_files",
             "get_company_overview",
+            "get_financial_report",
             "read_company_file",
             "create_new_company",
             "add_financial_record",
@@ -189,10 +190,11 @@ class TestToolRegistration:
 class TestLiveProtocol:
     def test_initialize_and_list_tools(self, client: StdioClient) -> None:
         tools = client.request("tools/list")["result"]["tools"]
-        assert len(tools) == 11
+        assert len(tools) == 12
         assert {tool["name"] for tool in tools} == {
             "list_company_files",
             "get_company_overview",
+            "get_financial_report",
             "read_company_file",
             "create_new_company",
             "add_financial_record",
@@ -539,6 +541,84 @@ class TestLiveProtocol:
         assert '"changed": []' in text
         assert "already matched" in text
         assert len(list(data_dir.glob("*.backup-*.json"))) == 2
+
+    def test_report_lists_totals_and_splits(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        client.call(
+            "add_financial_record",
+            {
+                "type": "income",
+                "category": "sales",
+                "amount": 12_000,
+                "description": "Satis",
+            },
+        )
+        client.call(
+            "add_financial_record",
+            {
+                "type": "expense",
+                "category": "rent",
+                "amount": 8_000,
+                "description": "Kira",
+            },
+        )
+        report = json.loads(client.call("get_financial_report", {}))
+        assert report["company_name"] == "Acme"
+        assert report["currency"] == "TRY"
+        assert report["totals"]["total_income"] == "12000.00"
+        assert report["totals"]["total_expenses"] == "8000.00"
+        assert report["totals"]["remaining_budget"] == "42000.00"
+        assert report["totals"]["budget_used_percent"] == 16.0
+        assert report["income_by_category"][0]["category"] == "sales"
+        assert report["income_by_category"][0]["share_percent"] == 100.0
+        assert report["expenses_by_category"][0]["amount"] == "8000.00"
+        assert report["cash_flow"]["period_count"] == 1
+        assert report["warnings"] == []
+
+    def test_report_period_filter(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        report = json.loads(client.call("get_financial_report", {"period": "initial"}))
+        assert report["cash_flow"]["period_filter"] == "initial"
+        assert [row["period"] for row in report["cash_flow"]["periods"]] == ["initial"]
+
+    def test_report_unknown_period_is_readable(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        text = client.call("get_financial_report", {"period": "yok"})
+        assert "unknown period 'yok'" in text
+        assert "Available periods: 'initial'" in text
+        assert "validation error" not in text.lower()
+
+    def test_report_without_ledger_is_readable(self, client: StdioClient) -> None:
+        text = client.call("get_financial_report", {})
+        assert "not found" in text.lower()
+
+    def test_report_does_not_write(self, client: StdioClient, data_dir: Path) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        client.call(
+            "add_financial_record",
+            {
+                "type": "income",
+                "category": "sales",
+                "amount": 1_000,
+                "description": "Satis",
+            },
+        )
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        client.call("get_financial_report", {})
+        client.call("get_financial_report", {"period": "initial"})
+        assert {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())} == before
 
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})

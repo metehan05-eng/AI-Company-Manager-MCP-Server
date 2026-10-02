@@ -459,6 +459,36 @@ def _describe_open_item(item: dict[str, Any]) -> str:
     return f"{item['key']} needs confirmation. {prefix}{item['note']}"
 
 
+def _category_breakdown(
+    financials: CompanyFinancials, record_type: FinancialType
+) -> list[dict[str, Any]]:
+    """Group one kind of record by category, biggest amount first."""
+    totals: dict[str, Decimal] = {}
+    counts: dict[str, int] = {}
+    for record in financials.records:
+        if record.type != record_type:
+            continue
+        totals[record.category] = totals.get(record.category, Decimal("0.00")) + record.amount
+        counts[record.category] = counts.get(record.category, 0) + 1
+
+    grand_total = sum(totals.values(), Decimal("0.00"))
+    rows: list[dict[str, Any]] = [
+        {
+            "category": category,
+            "amount": amount,
+            "record_count": counts[category],
+            "share_percent": (
+                float((amount / grand_total * 100).quantize(Decimal("0.1")))
+                if grand_total
+                else None
+            ),
+        }
+        for category, amount in totals.items()
+    ]
+    rows.sort(key=lambda row: (-row["amount"], row["category"]))
+    return rows
+
+
 def _apply_transform(name: str, value: Any) -> tuple[Any, str | None]:
     transforms: dict[str, Callable[[Any], tuple[Any, str | None]]] = {
         "copy": _transform_copy,
@@ -1540,6 +1570,70 @@ class CompanyWizard:
                 "expense_categories": financials.expense_categories,
             },
             "generated_at": _utc_now().isoformat(),
+        }
+
+    def get_financial_report(self, period: str | None = None) -> dict[str, Any]:
+        """Summarize the ledger: totals, per-category splits, and the cash flow periods.
+
+        Read-only. `period` narrows the cash flow table to a single period; omitting it
+        reports every period the template holds.
+        """
+        wanted = period.strip() if period is not None else None
+        with self._lock:
+            financials = self._read_model("financials.json", CompanyFinancials)
+
+        periods = [
+            {
+                "period": entry.period,
+                "opening_balance": entry.opening_balance,
+                "net_cash_flow": entry.net_cash_flow,
+                "closing_balance": entry.closing_balance,
+            }
+            for entry in financials.cash_flow_template
+        ]
+        if wanted is not None:
+            matches = [row for row in periods if row["period"] == wanted]
+            if not matches:
+                available = ", ".join(repr(row["period"]) for row in periods) or "none"
+                raise ValueError(f"unknown period {wanted!r}. Available periods: {available}")
+            periods = matches
+
+        total_expenses = financials.total_expenses
+        warnings: list[str] = []
+        if financials.current_balance < 0:
+            warnings.append(f"current balance is negative: {financials.current_balance}")
+        if total_expenses > financials.initial_budget:
+            warnings.append(
+                f"total expenses {total_expenses} exceed the initial budget "
+                f"{financials.initial_budget}"
+            )
+        remaining = financials.initial_budget - total_expenses
+        return {
+            "company_name": financials.company_name,
+            "currency": financials.currency,
+            "generated_at": _utc_now().isoformat(),
+            "totals": {
+                **financials.financial_summary(),
+                "remaining_budget": remaining,
+                "budget_used_percent": (
+                    float(
+                        (total_expenses / financials.initial_budget * 100).quantize(Decimal("0.1"))
+                    )
+                    if financials.initial_budget
+                    else None
+                ),
+            },
+            "income_by_category": _category_breakdown(financials, "income"),
+            "expenses_by_category": _category_breakdown(financials, "expense"),
+            "cash_flow": {
+                "period_filter": wanted,
+                "periods": periods,
+                "period_count": len(periods),
+                "total_net_cash_flow": sum(
+                    (row["net_cash_flow"] for row in periods), Decimal("0.00")
+                ),
+            },
+            "warnings": warnings,
         }
 
 

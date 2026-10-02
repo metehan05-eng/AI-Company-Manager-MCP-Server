@@ -494,6 +494,21 @@ def snapshot(data_dir: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
 
 
+def _add_cash_flow_period(data_dir: Path, period: str, opening: str, net_cash_flow: str) -> None:
+    """Append one projection period to an existing financials.json."""
+    path = data_dir / "financials.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["cash_flow_template"].append(
+        {
+            "period": period,
+            "opening_balance": opening,
+            "net_cash_flow": net_cash_flow,
+            "closing_balance": str(Decimal(opening) + Decimal(net_cash_flow)),
+        }
+    )
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
 class TestPlanCompanyDataMigration:
     def test_never_writes_anything(self, wizard: CompanyWizard, data_dir: Path) -> None:
         write_real_files(data_dir)
@@ -1122,3 +1137,142 @@ class TestOverview:
         (data_dir / "financials.json").write_text("{bozuk", encoding="utf-8")
         with pytest.raises(ValueError):
             company.get_company_overview()
+
+
+class TestGetFinancialReport:
+    def test_totals_and_budget_usage(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "sales", 4_000.0, "satis")
+        company.add_financial_record("expense", "rent", 1_500.0, "kira")
+        totals = company.get_financial_report()["totals"]
+        assert totals["total_income"] == Decimal("4000.00")
+        assert totals["total_expenses"] == Decimal("1500.00")
+        assert totals["remaining_budget"] == Decimal("8500.00")
+        assert totals["budget_used_percent"] == 15.0
+        assert totals["transaction_count"] == 2
+
+    def test_income_split_by_category_largest_first(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 1_000.0, "a")
+        company.add_financial_record("income", "sales", 3_000.0, "b")
+        company.add_financial_record("income", "sales", 500.0, "c")
+        rows = company.get_financial_report()["income_by_category"]
+        assert [row["category"] for row in rows] == ["sales", "services"]
+        assert rows[0]["amount"] == Decimal("3500.00")
+        assert rows[0]["record_count"] == 2
+        assert rows[0]["share_percent"] == 77.8
+        assert rows[1]["share_percent"] == 22.2
+
+    def test_expenses_split_is_separate_from_income(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "rent", 900.0, "yanlis yon")
+        company.add_financial_record("expense", "rent", 400.0, "dogru yon")
+        report = company.get_financial_report()
+        assert report["income_by_category"] == [
+            {
+                "category": "rent",
+                "amount": Decimal("900.00"),
+                "record_count": 1,
+                "share_percent": 100.0,
+            }
+        ]
+        assert report["expenses_by_category"][0]["amount"] == Decimal("400.00")
+
+    def test_empty_ledger_has_empty_splits(self, company: CompanyWizard) -> None:
+        report = company.get_financial_report()
+        assert report["income_by_category"] == []
+        assert report["expenses_by_category"] == []
+        assert report["totals"]["budget_used_percent"] == 0.0
+        assert report["warnings"] == []
+
+    def test_zero_budget_leaves_percentage_empty(self, wizard: CompanyWizard) -> None:
+        wizard.init_company("Acme", "Yazilim", 0.0)
+        assert wizard.get_financial_report()["totals"]["budget_used_percent"] is None
+
+    def test_cash_flow_periods_are_listed(self, company: CompanyWizard) -> None:
+        cash_flow = company.get_financial_report()["cash_flow"]
+        assert cash_flow["period_count"] == 1
+        assert cash_flow["period_filter"] is None
+        assert cash_flow["periods"] == [
+            {
+                "period": "initial",
+                "opening_balance": Decimal("10000.0"),
+                "net_cash_flow": Decimal("0.00"),
+                "closing_balance": Decimal("10000.0"),
+            }
+        ]
+
+    def test_period_filter_narrows_the_table(self, company: CompanyWizard, data_dir: Path) -> None:
+        _add_cash_flow_period(data_dir, "2025-Q1", "12000.00", "1500.00")
+        report = company.get_financial_report(period="2025-Q1")
+        assert report["cash_flow"]["period_filter"] == "2025-Q1"
+        assert [row["period"] for row in report["cash_flow"]["periods"]] == ["2025-Q1"]
+        assert report["cash_flow"]["total_net_cash_flow"] == Decimal("1500.00")
+
+    def test_all_periods_are_reported_without_a_filter(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        _add_cash_flow_period(data_dir, "2025-Q1", "12000.00", "1500.00")
+        _add_cash_flow_period(data_dir, "2025-Q2", "13500.00", "2000.00")
+        cash_flow = company.get_financial_report()["cash_flow"]
+        assert cash_flow["period_count"] == 3
+        assert cash_flow["total_net_cash_flow"] == Decimal("3500.00")
+
+    def test_period_filter_is_trimmed(self, company: CompanyWizard, data_dir: Path) -> None:
+        _add_cash_flow_period(data_dir, "2025-Q1", "12000.00", "1500.00")
+        report = company.get_financial_report(period="  2025-Q1  ")
+        assert report["cash_flow"]["period_filter"] == "2025-Q1"
+
+    def test_unknown_period_lists_the_available_ones(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        _add_cash_flow_period(data_dir, "2025-Q1", "12000.00", "1500.00")
+        with pytest.raises(ValueError) as excinfo:
+            company.get_financial_report(period="2026-Q1")
+        assert "unknown period '2026-Q1'" in str(excinfo.value)
+        assert "'initial'" in str(excinfo.value)
+        assert "'2025-Q1'" in str(excinfo.value)
+
+    def test_warns_when_expenses_exceed_the_budget(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "payroll", 12_000.0, "maas")
+        warnings = company.get_financial_report()["warnings"]
+        assert any("exceed the initial budget" in warning for warning in warnings)
+
+    def test_warns_when_the_balance_is_negative(self, wizard: CompanyWizard) -> None:
+        wizard.init_company("Acme", "Yazilim", 0.0)
+        wizard.add_financial_record("expense", "rent", 500.0, "kira")
+        warnings = wizard.get_financial_report()["warnings"]
+        assert any("current balance is negative" in warning for warning in warnings)
+
+    def test_healthy_ledger_has_no_warnings(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "sales", 20_000.0, "satis")
+        assert company.get_financial_report()["warnings"] == []
+
+    def test_report_carries_company_and_currency(self, company: CompanyWizard) -> None:
+        report = company.get_financial_report()
+        assert report["company_name"] == "Acme"
+        assert report["currency"] == "TRY"
+        assert report["generated_at"]
+
+    def test_report_does_not_write(self, company: CompanyWizard, data_dir: Path) -> None:
+        company.add_financial_record("income", "sales", 1_000.0, "satis")
+        before = snapshot(data_dir)
+        company.get_financial_report()
+        company.get_financial_report(period="initial")
+        assert snapshot(data_dir) == before
+
+    def test_missing_ledger_raises_readable_error(self, wizard: CompanyWizard) -> None:
+        with pytest.raises(FileNotFoundError) as excinfo:
+            wizard.get_financial_report()
+        assert "not found" in str(excinfo.value).lower()
+
+    def test_works_on_a_migrated_real_ledger(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        write_json(data_dir, "company_profile.json", dict(REAL_PROFILE))
+        write_json(data_dir, "financials.json", dict(REAL_FINANCIALS))
+        wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        report = wizard.get_financial_report()
+        totals = report["totals"]
+        assert report["currency"] == "USD"
+        assert totals["opening_balance"] == Decimal("850000.0")
+        assert totals["transaction_count"] == 4
+        assert totals["current_balance"] == (totals["opening_balance"] + totals["net_cash_flow"])
+        assert report["expenses_by_category"]
+        assert report["income_by_category"][0]["amount"] > Decimal("0")
+        assert report["cash_flow"]["period_count"] == 1

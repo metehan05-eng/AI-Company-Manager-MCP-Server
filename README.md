@@ -27,6 +27,7 @@ Installs with a single command and runs on Windows, Linux and macOS.
 - [MCP Client Setup](#mcp-client-setup)
 - [MCP Tools](#mcp-tools)
 - [Example Client Calls](#example-client-calls)
+- [Financial Report](#financial-report)
 - [Data Layout](#data-layout)
 - [Using an Existing `employees.csv`](#using-an-existing-employeescsv)
 - [Mapping an Existing Profile and Ledger](#mapping-an-existing-profile-and-ledger)
@@ -278,6 +279,7 @@ OpenCode only reads its settings at startup, so restart it after editing.
 |---|---|---|
 | `list_company_files` | Lists every file in the data directory with type, size and modification time. | — |
 | `get_company_overview` | Returns a summary of profile, budget, income, expenses, net cash flow and current balance. | — |
+| `get_financial_report` | Reports the same totals plus income and expense splits by category and the cash flow periods. Read-only. | — (`period` is optional) |
 | `read_company_file` | Converts a supported file into text the AI can analyze. | `filename` |
 | `create_new_company` | Creates the profile, financial file and founder row. | `company_name`, `sector`, `initial_budget` |
 | `add_financial_record` | Appends an `income` or `expense` transaction to `financials.json`. | `type`, `category`, `amount`, `description` |
@@ -306,6 +308,31 @@ Natural language examples:
 - "Add a 45,000 expense under the infrastructure category."
 - "Create a note titled Strategy: we are targeting a European launch in 2026."
 - "Read the management report and list the risks."
+
+## Financial Report
+
+`get_company_overview` answers "where do we stand?". `get_financial_report` answers "why?",
+and stays read-only.
+
+| Block | Contents |
+|---|---|
+| `totals` | Budget, opening balance, income, expenses, net cash flow, current balance, transaction count, plus `remaining_budget` and `budget_used_percent`. |
+| `income_by_category` | Every category that received income, largest first, with its amount, record count and `share_percent`. |
+| `expenses_by_category` | The same split for expenses. |
+| `cash_flow` | Every period in `cash_flow_template` with opening balance, net cash flow and closing balance, plus the summed net cash flow. |
+| `warnings` | Empty when the ledger is healthy. Otherwise a negative current balance or expenses above the initial budget. |
+
+Categories are reported exactly as they are stored, and the split is per record type: an
+`income` under `rent` never inflates the expense split. `share_percent` is `null` when a
+split has no amount to divide, and `budget_used_percent` is `null` when the budget is zero.
+
+Pass `period` to narrow the cash flow table to one entry; an unknown period is an error that
+lists the available ones rather than an empty table.
+
+```json
+{"tool": "get_financial_report", "arguments": {}}
+{"tool": "get_financial_report", "arguments": {"period": "2025-Q1"}}
+```
 
 ## Data Layout
 
@@ -523,7 +550,7 @@ the server and validates the tool list with a `tools/list` call. Use
 - [x] Read existing `employees.csv` with common column names; schema inspection and migration
 - [x] Read-only mapping proposals for existing `company_profile.json` and `financials.json`
 - [x] Apply a confirmed `company_profile.json` / `financials.json` mapping with a backup
-- [ ] Period breakdown table for budget and cash flow
+- [x] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
 - [ ] Character budget for `read_company_file` output and PDF page ranges
 - [ ] Excel/PPTX reading support

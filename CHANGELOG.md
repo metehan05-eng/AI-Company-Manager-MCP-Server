@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `get_financial_report` tool: a read-only breakdown of `financials.json`. Reports the
+  totals, remaining budget and budget usage, splits income and expenses by category
+  (largest first, with record count and share), and lists the `cash_flow_template`
+  periods with their opening balance, net cash flow and closing balance. Pass `period` to
+  narrow the cash flow table; an unknown period lists the available ones. `warnings` is
+  empty for a healthy ledger and otherwise reports a negative balance or expenses above
+  the initial budget.
 - `apply_company_data_migration` tool: writes the mapping that
   `plan_company_data_migration` proposed. Every open item is answerable by key
   (`<file>:<field>`); `true` accepts the suggestion and any other value replaces it.
@@ -57,9 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned
 
-- `get_financial_report`, `update_employee`, `delete_financial_record`, and
-  `list_notes` tools
-- Apply a confirmed profile/ledger mapping with a backup
+- `update_employee`, `delete_financial_record`, and `list_notes` tools
+- Character budget for `read_company_file` output and PDF page ranges
+- Excel and PPTX reading support
+- Support for multiple company data directories
+- Backup/archive tool
 
 ## [0.2.0] - 2026-09-29
 
