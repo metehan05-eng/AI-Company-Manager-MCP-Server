@@ -229,7 +229,8 @@ def _resolve_employee_columns(columns: list[object]) -> dict[object, str]:
     return resolved
 
 
-def _default_employee_id(value: object) -> str:
+def _normalize_employee_id(value: object) -> str:
+    """Return a usable EMP id for one cell, or an empty string when it has none."""
     text = str(value).strip()
     if not text:
         return ""
@@ -238,7 +239,29 @@ def _default_employee_id(value: object) -> str:
     digits = re.findall(r"\d+", text)
     if digits:
         return f"EMP-{int(digits[-1]):04d}"
-    return f"EMP-{abs(hash(text)) % 9000 + 1000:04d}"
+    return ""
+
+
+def _assign_employee_ids(values: pd.Series) -> pd.Series:
+    """Normalize the id column and give every row without one the next free EMP number.
+
+    Ids are derived from the row order and never from a hash, so migrating the same
+    file twice produces the same file.
+    """
+    normalized = [_normalize_employee_id(value) for value in values]
+    used = {value for value in normalized if value}
+    filled: list[str] = []
+    next_number = 1
+    for value in normalized:
+        if value:
+            filled.append(value)
+            continue
+        while f"EMP-{next_number:04d}" in used:
+            next_number += 1
+        assigned = f"EMP-{next_number:04d}"
+        used.add(assigned)
+        filled.append(assigned)
+    return pd.Series(filled, index=values.index, dtype=object)
 
 
 def _default_employee_start_date(value: object) -> str:
@@ -895,7 +918,7 @@ class CompanyWizard:
         ordered = renamed[EMPLOYEE_COLUMNS + extra_columns].copy()
         ordered["start_date"] = ordered["start_date"].apply(_default_employee_start_date)
         ordered["status"] = ordered["status"].apply(_default_employee_status)
-        ordered["employee_id"] = ordered["employee_id"].apply(_default_employee_id)
+        ordered["employee_id"] = _assign_employee_ids(ordered["employee_id"])
         return ordered
 
     def add_employee(
@@ -1059,7 +1082,7 @@ class CompanyWizard:
         canonical = renamed[EMPLOYEE_COLUMNS + extra_columns].copy()
         canonical["start_date"] = canonical["start_date"].apply(_default_employee_start_date)
         canonical["status"] = canonical["status"].apply(_default_employee_status)
-        canonical["employee_id"] = canonical["employee_id"].apply(_default_employee_id)
+        canonical["employee_id"] = _assign_employee_ids(canonical["employee_id"])
 
         result: dict[str, Any] = {
             "changed": True,

@@ -373,6 +373,12 @@ Only `name`, `role`, `department` and `salary` are strictly required. Missing
 "inactive" value is treated as `active`. Columns the tools do not recognize, such as
 `performance_score`, are **preserved** on read and on every subsequent write.
 
+An `employee_id` that is missing, blank, or carries no digits is replaced by the next free
+number in the `EMP-0001` series, assigned in row order and skipping numbers that the file
+already uses. Ids are never derived from a hash, so migrating the same file twice produces
+byte-identical output, and `add_employee` continues the same series instead of restarting
+it.
+
 Use `inspect_company_data` to see which files match the schema and what is blocking the
 others. Use `migrate_company_data` to permanently rewrite `employees.csv` in the canonical
 layout; it is a dry run by default and writes a timestamped backup before applying.

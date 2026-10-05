@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -11,6 +14,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from conftest import PROJECT_ROOT
 from src.company_wizard import CompanyWizard, _apply_transform
 from src.file_handler import FileHandler
 
@@ -1276,3 +1280,154 @@ class TestGetFinancialReport:
         assert report["expenses_by_category"]
         assert report["income_by_category"][0]["amount"] > Decimal("0")
         assert report["cash_flow"]["period_count"] == 1
+
+
+class TestEmployeeIdDefaults:
+    """Regression tests: a legacy file without usable ids must still get stable ones."""
+
+    NO_ID = (
+        "full_name,role,department,monthly_salary_usd\n"
+        "Deniz Kaya,Developer,Ar-Ge,90000\n"
+        "Asli Yilmaz,Designer,Ar-Ge,80000\n"
+        "Mert Aydin,Product Owner,Growth,70000\n"
+    )
+
+    def _write(self, data_dir: Path, content: str) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(content, encoding="utf-8")
+
+    def test_missing_id_column_gets_sequential_ids(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(data_dir, self.NO_ID)
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0001", "EMP-0002", "EMP-0003"]
+
+    def test_migration_of_a_file_without_ids_writes_them(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(data_dir, self.NO_ID)
+        wizard.migrate_company_data(apply=True)
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        assert list(frame["employee_id"]) == ["EMP-0001", "EMP-0002", "EMP-0003"]
+        assert list(frame["name"]) == ["Deniz Kaya", "Asli Yilmaz", "Mert Aydin"]
+
+    def test_blank_id_cells_get_sequential_ids(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\n"
+            ",Deniz Kaya,Developer,Ar-Ge,90000\n"
+            ",Asli Yilmaz,Designer,Ar-Ge,80000\n",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0001", "EMP-0002"]
+
+    def test_existing_ids_are_kept(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\n"
+            "EMP-0007,Deniz Kaya,Developer,Ar-Ge,90000\n"
+            "EMP-0008,Asli Yilmaz,Designer,Ar-Ge,80000\n",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0007", "EMP-0008"]
+
+    def test_assigned_ids_do_not_collide_with_existing_ones(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\n"
+            "EMP-0001,Deniz Kaya,Developer,Ar-Ge,90000\n"
+            ",Asli Yilmaz,Designer,Ar-Ge,80000\n"
+            "EMP-0003,Mert Aydin,Product Owner,Growth,70000\n",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0001", "EMP-0002", "EMP-0003"]
+        assert len(set(frame["employee_id"])) == 3
+
+    def test_legacy_digit_ids_are_normalized(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\nE101,Metehan Erbasc,CTO,Ar-Ge,8500\n",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0101"]
+
+    def test_value_without_digits_is_replaced(self, wizard: CompanyWizard, data_dir: Path) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\nDeniz Kaya,Developer,Ar-Ge,90000\n",
+        )
+        frame = wizard._read_employees()
+        assert list(frame["employee_id"]) == ["EMP-0001"]
+
+    def test_ids_are_reproducible_for_the_same_input(
+        self, wizard: CompanyWizard, data_dir: Path, tmp_path: Path
+    ) -> None:
+        first = data_dir / "employees.csv"
+        self._write(data_dir, self.NO_ID)
+        wizard.migrate_company_data(apply=True)
+        first_bytes = first.read_bytes()
+
+        other = tmp_path / "second"
+        other.mkdir()
+        (other / "employees.csv").write_text(self.NO_ID, encoding="utf-8")
+        second = CompanyWizard(FileHandler(data_dir=other))
+        second.migrate_company_data(apply=True)
+        assert (other / "employees.csv").read_bytes() == first_bytes
+
+    def test_ids_are_identical_in_a_fresh_interpreter(self) -> None:
+        """A hash-based id would change with PYTHONHASHSEED, so compare two processes."""
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(PROJECT_ROOT)!r})\n"
+            "import pandas as pd\n"
+            "from src.company_wizard import _assign_employee_ids\n"
+            "values = pd.Series(['Deniz Kaya', 'Asli Yilmaz'], dtype=object)\n"
+            "print(','.join(_assign_employee_ids(values)))\n"
+        )
+
+        def run_with_seed(seed: str) -> str:
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=str(PROJECT_ROOT),
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+
+        assert run_with_seed("1") == run_with_seed("2") == "EMP-0001,EMP-0002"
+
+    def test_second_migration_leaves_the_file_untouched(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(data_dir, self.NO_ID)
+        wizard.migrate_company_data(apply=True)
+        after_first = (data_dir / "employees.csv").read_bytes()
+        result = wizard.migrate_company_data(apply=True)
+        assert result["changed"] is False
+        assert (data_dir / "employees.csv").read_bytes() == after_first
+
+    def test_added_employee_continues_the_assigned_sequence(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(data_dir, self.NO_ID)
+        result = wizard.add_employee("Zeynep Sahin", "Lead AI", "Ar-Ge", 5200.0)
+        assert result["employee"]["employee_id"] == "EMP-0004"
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        assert list(frame["employee_id"]) == ["EMP-0001", "EMP-0002", "EMP-0003", "EMP-0004"]
+
+    def test_added_employee_after_existing_high_id(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        self._write(
+            data_dir,
+            "id,full_name,role,department,monthly_salary_usd\n"
+            "EMP-0102,Deniz Kaya,Developer,Ar-Ge,90000\n"
+            ",Asli Yilmaz,Designer,Ar-Ge,80000\n",
+        )
+        result = wizard.add_employee("Mert Aydin", "Product Owner", "Growth", 7000.0)
+        assert result["employee"]["employee_id"] == "EMP-0103"

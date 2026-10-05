@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `full_name`, `monthly_salary_usd`, `hire_date`, `durum`, and others) are mapped to
   the canonical schema. Unrecognized columns such as `performance_score` are preserved
   across reads and writes instead of being dropped.
-- Automatic defaults for absent `employee_id`, `start_date` and `status`; `start_date`
+- Automatic defaults for absent `start_date` and `status`; `start_date`
   accepts `YYYY-MM-DD`, `DD.MM.YYYY` and `DD/MM/YYYY`.
 - Actionable error messages that list the columns actually found and point to
   `migrate_company_data`.
@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-file problems in the migration plan are now answerable open items
   (`company_profile.json:currency`, `financials.json:company_name`) instead of plain text
   questions, so they can be confirmed with `apply_company_data_migration`.
+
+### Fixed
+
+- Migrating an `employees.csv` with no usable `id` column left `employee_id` **empty** for
+  every row, so employees had no stable identifier. Missing, blank, and digit-free ids are
+  now filled from the `EMP-0001` series in row order, skipping numbers already used in the
+  file. `add_employee` continues that series instead of restarting it.
+- Generated employee ids came from `hash()`, which Python randomizes per process, so the
+  same file migrated twice produced different ids. Ids are now derived from row order, and
+  migrating the same input twice is byte-identical. Covered by a test that compares two
+  interpreters with different `PYTHONHASHSEED` values.
 
 ### Not changed
 
