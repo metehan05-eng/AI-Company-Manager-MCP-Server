@@ -179,8 +179,8 @@ def any_of(schema: dict[str, Any], kind: str) -> dict[str, Any]:
 
 
 class TestToolRegistration:
-    def test_twelve_tools_registered(self) -> None:
-        assert len(mcp._tool_manager.list_tools()) == 12
+    def test_all_tools_registered(self) -> None:
+        assert len(mcp._tool_manager.list_tools()) == 19
 
     def test_every_tool_has_description(self) -> None:
         for tool in mcp._tool_manager.list_tools():
@@ -201,6 +201,13 @@ class TestToolRegistration:
             "migrate_company_data",
             "plan_company_data_migration",
             "apply_company_data_migration",
+            "list_audit_entries",
+            "get_variance_report",
+            "run_scenario",
+            "list_risks",
+            "add_risk",
+            "update_risk",
+            "delete_risk",
         ],
     )
     def test_tool_exists(self, name: str) -> None:
@@ -210,7 +217,7 @@ class TestToolRegistration:
 class TestLiveProtocol:
     def test_initialize_and_list_tools(self, client: StdioClient) -> None:
         tools = client.request("tools/list")["result"]["tools"]
-        assert len(tools) == 12
+        assert len(tools) == 19
         assert {tool["name"] for tool in tools} == {
             "list_company_files",
             "get_company_overview",
@@ -224,6 +231,13 @@ class TestLiveProtocol:
             "migrate_company_data",
             "plan_company_data_migration",
             "apply_company_data_migration",
+            "list_audit_entries",
+            "get_variance_report",
+            "run_scenario",
+            "list_risks",
+            "add_risk",
+            "update_risk",
+            "delete_risk",
         }
 
     def test_schemas_expose_required_fields(self, client: StdioClient) -> None:
@@ -643,6 +657,155 @@ class TestLiveProtocol:
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})
         assert "traversal" in text.lower() or "escapes" in text.lower()
+
+    def test_audit_journal_records_every_live_call(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "expense", "category": "kira", "amount": 800, "description": "ofis"},
+        )
+        client.call("update_company_notes", {"note_title": "Not", "content": "Gundem"})
+        listing = client.call_json("list_audit_entries", {})
+        assert listing["total_entries"] == 3
+        assert [entry["action"] for entry in listing["entries"]] == [
+            "note_created",
+            "financial_record_added",
+            "company_initialized",
+        ]
+        assert listing["actions"] == [
+            "company_initialized",
+            "financial_record_added",
+            "note_created",
+        ]
+        filtered = client.call_json("list_audit_entries", {"action": "financial_record_added"})
+        assert filtered["filtered_total"] == 1
+        assert filtered["entries"][0]["target"].startswith("financials.json:")
+
+    def test_unknown_audit_action_is_readable(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        text = client.call("list_audit_entries", {"action": "made_up"})
+        assert "unknown action 'made_up'" in text
+        assert "company_initialized" in text
+        assert "validation error" not in text.lower()
+
+    def test_variance_report_over_the_live_ledger(self, client: StdioClient) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "income", "category": "sales", "amount": 12_000, "description": "satis"},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "expense", "category": "kira", "amount": 8_000, "description": "ofis"},
+        )
+        report = json.loads(client.call("get_variance_report", {}))
+        assert report["budget"]["spent"] == "8000.00"
+        assert report["budget"]["used_percent"] == 16.0
+        assert report["budget"]["over_budget"] is False
+        assert report["monthly"][0]["income"] == "12000.00"
+        assert report["monthly"][0]["expense"] == "8000.00"
+        assert report["monthly"][0]["change_vs_previous"] is None
+        text = client.call("get_variance_report", {"month": "1999-01"})
+        assert "unknown month '1999-01'" in text
+        assert "validation error" not in text.lower()
+
+    def test_variance_report_never_writes(self, client: StdioClient, data_dir: Path) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 50_000},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "expense", "category": "kira", "amount": 800, "description": "ofis"},
+        )
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        first = json.loads(client.call("get_variance_report", {}))
+        client.call("get_variance_report", {"month": first["monthly"][0]["month"]})
+        assert {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())} == before
+
+    def test_scenario_projects_and_stays_read_only(
+        self, client: StdioClient, data_dir: Path
+    ) -> None:
+        client.call(
+            "create_new_company",
+            {"company_name": "Acme", "sector": "Yazilim", "initial_budget": 10_000},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "income", "category": "sales", "amount": 1_000, "description": "satis"},
+        )
+        client.call(
+            "add_financial_record",
+            {"type": "expense", "category": "payroll", "amount": 6_000, "description": "maas"},
+        )
+        before = {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())}
+        result = client.call_json(
+            "run_scenario",
+            {"horizon_months": 4, "expense_change_percent": 10.0},
+        )
+        assert len(result["months"]) == 4
+        assert result["months"][0]["opening_balance"] == "5000.00"
+        assert result["months"][0]["expense"] == "6600.00"
+        assert result["summary"]["runway_months"] == 1
+        assert "turns negative" in " ".join(result["warnings"])
+        assert {path.name: path.read_bytes() for path in sorted(data_dir.iterdir())} == before
+        assert client.call_json("list_audit_entries", {})["total_entries"] == 3
+
+    def test_risk_tools_round_trip(self, client: StdioClient) -> None:
+        created = client.call_json(
+            "add_risk",
+            {
+                "title": "Kur riski",
+                "likelihood": "high",
+                "impact": "high",
+                "category": "finans",
+                "owner": "CFO",
+            },
+        )
+        assert created["risk"]["score"] == 9
+        assert created["risk"]["level"] == "critical"
+        risk_id = created["risk"]["id"]
+        listed = client.call_json("list_risks", {})
+        assert listed["count"] == listed["total_count"] == 1
+        assert listed["by_level"]["critical"] == 1
+        updated = client.call_json(
+            "update_risk",
+            {"risk_id": risk_id, "changes": {"status": "mitigating", "likelihood": "low"}},
+        )
+        assert updated["changed_fields"] == ["likelihood", "status"]
+        assert updated["risk"]["score"] == 3
+        actions = {
+            entry["action"] for entry in client.call_json("list_audit_entries", {})["entries"]
+        }
+        assert {"risk_added", "risk_updated"} <= actions
+        client.call("delete_risk", {"risk_id": risk_id})
+        assert client.call_json("list_risks", {})["total_count"] == 0
+        actions = {
+            entry["action"] for entry in client.call_json("list_audit_entries", {})["entries"]
+        }
+        assert "risk_deleted" in actions
+
+    def test_risk_validation_errors_are_readable(self, client: StdioClient) -> None:
+        bad_rating = client.call(
+            "add_risk", {"title": "Risk", "likelihood": "certain", "impact": "low"}
+        )
+        assert "Input should be 'low', 'medium' or 'high'" in bad_rating
+        assert "1 validation error" not in bad_rating
+        assert "received: 'certain'" in bad_rating
+        bad_status = client.call("list_risks", {"status": "unknown"})
+        assert "status must be 'open', 'mitigating' or 'closed'" in bad_status
+        missing = client.call("delete_risk", {"risk_id": "yok"})
+        assert "unknown risk id 'yok'" in missing
+        assert "validation error" not in missing.lower()
 
 
 class TestReadCompanyFileBudget:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date
@@ -31,6 +32,7 @@ class TestInitCompany:
             "company_profile.json",
             "financials.json",
             "employees.csv",
+            "audit_log.json",
         }
         assert "initialized successfully" in result["message"].lower()
 
@@ -1431,3 +1433,535 @@ class TestEmployeeIdDefaults:
         )
         result = wizard.add_employee("Mert Aydin", "Product Owner", "Growth", 7000.0)
         assert result["employee"]["employee_id"] == "EMP-0103"
+
+
+def spread_records_across(data_dir: Path, months: list[str]) -> None:
+    """Move the existing financial records one per listed YYYY-MM month, in order."""
+    path = data_dir / "financials.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for record, month in zip(payload["records"], months, strict=True):
+        record["recorded_at"] = f"{month}-01T12:00:00+00:00"
+    write_json(data_dir, "financials.json", payload)
+
+
+class TestAuditTrail:
+    def test_init_company_journals_the_first_entry(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        result = company.list_audit_entries()
+        assert result["total_entries"] == 1
+        assert result["filtered_total"] == 1
+        entry = result["entries"][0]
+        assert entry["seq"] == 1
+        assert entry["action"] == "company_initialized"
+        assert entry["target"] == "company_profile.json"
+        assert "Acme" in entry["summary"]
+        assert entry["details"]["company_name"] == "Acme"
+        assert float(entry["details"]["initial_budget"]) == 10_000.0
+        assert (data_dir / "audit_log.json").exists()
+
+    def test_entries_are_newest_first_with_a_gapless_sequence(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 1000.0, "g")
+        company.add_financial_record("expense", "rent", 400.0, "g")
+        company.update_company_notes("Strateji", "Büyüme")
+        company.add_risk("Kur riski", "high", "medium")
+        seqs = [entry["seq"] for entry in company.list_audit_entries()["entries"]]
+        assert seqs == [5, 4, 3, 2, 1]
+        assert company.list_audit_entries()["entries"][0]["action"] == "risk_added"
+
+    def test_every_mutation_records_an_entry(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "rent", 500.0, "kira")
+        company.add_employee("Zeynep Sahin", "Lead AI", "Ar-Ge", 5200.0)
+        company.update_company_notes("Toplanti", "Gundem")
+        company.update_company_notes("Toplanti", "Yeni gundem")
+        company.add_risk("Tedarikçi iflası", "medium", "high")
+        actions = {entry["action"] for entry in company.list_audit_entries()["entries"]}
+        assert actions == {
+            "company_initialized",
+            "financial_record_added",
+            "employee_added",
+            "note_created",
+            "note_updated",
+            "risk_added",
+        }
+
+    def test_financial_record_entry_carries_the_record(self, company: CompanyWizard) -> None:
+        result = company.add_financial_record("expense", "kira", 1500.5, "ofis")
+        entry = company.list_audit_entries(action="financial_record_added")["entries"][0]
+        assert entry["details"]["record"]["id"] == result["record"]["id"]
+        assert float(entry["details"]["record"]["amount"]) == 1500.5
+        assert entry["details"]["record"]["category"] == "kira"
+        assert entry["details"]["category_added"] is True
+        assert "1500.5 TRY" in entry["summary"]
+        assert entry["target"].startswith("financials.json:")
+
+    def test_note_entry_records_both_versions(self, company: CompanyWizard) -> None:
+        company.update_company_notes("Politika", "Ilk surum")
+        second = company.update_company_notes("Politika", "Guncellenmis surum")
+        entry = company.list_audit_entries(action="note_updated")["entries"][0]
+        assert entry["details"]["content_before"] == "Ilk surum"
+        assert entry["details"]["content_after"] == "Guncellenmis surum"
+        assert entry["details"]["content_length_before"] == 9
+        assert entry["details"]["content_length_after"] == 18
+        assert entry["details"]["note_id"] == second["note"]["id"]
+        assert entry["target"] == f"company_notes.json:{second['note']['id']}"
+
+    def test_long_values_are_clipped_but_the_note_is_stored_whole(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.update_company_notes("Uzun Not", "ilk surum")
+        content = "x" * 600
+        company.update_company_notes("Uzun Not", content)
+        entry = company.list_audit_entries(action="note_updated")["entries"][0]
+        stored = entry["details"]["content_after"]
+        assert len(stored) == 500
+        assert stored.endswith("…")
+        saved = json.loads((data_dir / "company_notes.json").read_text(encoding="utf-8"))
+        assert saved["notes"][0]["content"] == content
+
+    def test_dry_runs_write_no_journal_entry(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "rent", 500.0, "a")
+        before = company.list_audit_entries()["total_entries"]
+        company.plan_company_data_migration()
+        company.migrate_company_data()
+        company.apply_company_data_migration(answers={}, apply=False)
+        company.run_scenario(horizon_months=3)
+        assert company.list_audit_entries()["total_entries"] == before
+
+    def test_applied_data_migration_is_journaled_with_its_backups(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        result = wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        entry = wizard.list_audit_entries(action="data_migration_applied")["entries"][0]
+        assert entry["details"]["changed_files"] == sorted(result["backups"])
+        assert entry["details"]["backups"] == result["backups"]
+        assert entry["details"]["resolved"] == result["resolved"]
+
+    def test_applied_employee_migration_is_journaled(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_file(data_dir, "employees.csv", TestLegacyEmployeeSchema.LEGACY)
+        wizard.migrate_company_data(apply=True)
+        entry = wizard.list_audit_entries(action="employees_migrated")["entries"][0]
+        assert entry["details"]["backup_file"].startswith("employees.backup-")
+        assert entry["details"]["row_count"] == 2
+        assert "(2 rows)" in entry["summary"]
+
+    def test_failed_write_removes_the_entry_again(
+        self, company: CompanyWizard, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = company.list_audit_entries()["total_entries"]
+        original = company.file_handler.write_file
+
+        def failing(filename: str, content: object) -> dict[str, Any]:
+            if filename == "financials.json":
+                msg = "disk full"
+                raise OSError(msg)
+            return original(filename, content)
+
+        monkeypatch.setattr(company.file_handler, "write_file", failing)
+        with pytest.raises(OSError, match="disk full"):
+            company.add_financial_record("expense", "rent", 500.0, "kira")
+        assert company.list_audit_entries()["total_entries"] == before
+        financials = json.loads((data_dir / "financials.json").read_text(encoding="utf-8"))
+        assert financials["records"] == []
+
+    def test_unknown_action_filter_lists_what_exists(self, company: CompanyWizard) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            company.list_audit_entries(action="made_up")
+        message = str(excinfo.value)
+        assert "unknown action 'made_up'" in message
+        assert "company_initialized" in message
+
+    def test_paging_and_bounds(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 100.0, "a")
+        company.add_financial_record("income", "services", 200.0, "b")
+        first = company.list_audit_entries(limit=1, offset=0)
+        second = company.list_audit_entries(limit=1, offset=1)
+        assert [entry["seq"] for entry in first["entries"]] == [3]
+        assert [entry["seq"] for entry in second["entries"]] == [2]
+        assert first["has_more"] is True
+        assert first["filtered_total"] == first["total_entries"] == 3
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            company.list_audit_entries(limit=0)
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            company.list_audit_entries(limit=501)
+        with pytest.raises(ValueError, match="must not be negative"):
+            company.list_audit_entries(offset=-1)
+
+    def test_risk_actions_are_journaled(self, company: CompanyWizard) -> None:
+        created = company.add_risk("Kur riski", "high", "high")
+        risk_id = created["risk"]["id"]
+        company.update_risk(risk_id, {"status": "mitigating"})
+        company.delete_risk(risk_id)
+        entries = company.list_audit_entries()["entries"]
+        assert [entry["action"] for entry in entries[:3]] == [
+            "risk_deleted",
+            "risk_updated",
+            "risk_added",
+        ]
+        assert entries[1]["details"]["changed_fields"] == ["status"]
+        assert entries[2]["details"]["risk"]["level"] == "critical"
+
+
+class TestVarianceReport:
+    def test_budget_block_and_single_month(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 5000.0, "g")
+        company.add_financial_record("expense", "rent", 3000.0, "g")
+        report = company.get_variance_report()
+        assert report["company_name"] == "Acme"
+        assert report["currency"] == "TRY"
+        assert report["month_filter"] is None
+        assert report["month_count"] == 1
+        assert report["record_count"] == 2
+        assert report["budget"] == {
+            "initial_budget": Decimal("10000"),
+            "spent": Decimal("3000.00"),
+            "remaining": Decimal("7000.00"),
+            "over_budget": False,
+            "used_percent": 30.0,
+        }
+        assert report["warnings"] == []
+        row = report["monthly"][0]
+        assert row["month"] == report["generated_at"][:7]
+        assert row["income"] == Decimal("5000.00")
+        assert row["expense"] == Decimal("3000.00")
+        assert row["net"] == Decimal("2000.00")
+        assert row["change_vs_previous"] is None
+        assert row["change_percent_vs_previous"] is None
+
+    def test_month_over_month_change_and_percentages(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        company.add_financial_record("expense", "rent", 5000.0, "a")
+        company.add_financial_record("income", "services", 6000.0, "b")
+        company.add_financial_record("expense", "rent", 5000.0, "b")
+        spread_records_across(data_dir, ["2026-01", "2026-01", "2026-02", "2026-02"])
+        report = company.get_variance_report()
+        assert [row["month"] for row in report["monthly"]] == ["2026-01", "2026-02"]
+        first, second = report["monthly"]
+        assert first["change_vs_previous"] is None
+        assert second["change_vs_previous"] == {
+            "income": Decimal("1000.00"),
+            "expense": Decimal("0.00"),
+            "net": Decimal("1000.00"),
+        }
+        assert second["change_percent_vs_previous"] == {
+            "income": 20.0,
+            "expense": 0.0,
+            "net": None,
+        }
+        assert report["budget"]["spent"] == Decimal("10000.00")
+        assert report["budget"]["used_percent"] == 100.0
+        assert report["budget"]["over_budget"] is False
+
+    def test_month_filter_returns_only_that_month(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        company.add_financial_record("expense", "rent", 1000.0, "b")
+        spread_records_across(data_dir, ["2026-01", "2026-02"])
+        report = company.get_variance_report(month="2026-02")
+        assert report["month_filter"] == "2026-02"
+        assert [row["month"] for row in report["monthly"]] == ["2026-02"]
+        assert report["month_count"] == 2
+
+    def test_unknown_month_lists_available_months(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        spread_records_across(data_dir, ["2026-01"])
+        with pytest.raises(ValueError) as excinfo:
+            company.get_variance_report(month="2025-12")
+        assert "unknown month '2025-12'" in str(excinfo.value)
+        assert "2026-01" in str(excinfo.value)
+
+    def test_malformed_month_is_rejected(self, company: CompanyWizard) -> None:
+        for bad in ("2026-13", "2026-1", "October 2026"):
+            with pytest.raises(ValueError, match="formatted as YYYY-MM"):
+                company.get_variance_report(month=bad)
+
+    def test_over_budget_and_negative_balance_are_flagged(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "equipment", 12000.0, "x")
+        report = company.get_variance_report()
+        assert report["budget"]["over_budget"] is True
+        assert report["budget"]["remaining"] == Decimal("-2000.00")
+        assert report["budget"]["used_percent"] == 120.0
+        warnings = " ".join(report["warnings"])
+        assert "exceed the initial budget" in warnings
+        assert "negative" in warnings
+
+    def test_company_without_records_warns_but_does_not_fail(self, company: CompanyWizard) -> None:
+        report = company.get_variance_report()
+        assert report["monthly"] == []
+        assert report["month_count"] == 0
+        assert report["budget"]["spent"] == Decimal("0.00")
+        assert report["budget"]["used_percent"] == 0.0
+        assert any("no financial records" in item for item in report["warnings"])
+
+    def test_report_never_writes_to_disk(self, company: CompanyWizard, data_dir: Path) -> None:
+        company.add_financial_record("expense", "rent", 500.0, "x")
+        before = snapshot(data_dir)
+        company.get_variance_report()
+        company.get_variance_report(month=None)
+        assert snapshot(data_dir) == before
+
+
+class TestScenario:
+    def test_requires_at_least_one_record(self, company: CompanyWizard) -> None:
+        with pytest.raises(ValueError, match="needs at least one income or expense record"):
+            company.run_scenario()
+
+    def test_baseline_is_the_monthly_average(self, company: CompanyWizard, data_dir: Path) -> None:
+        company.add_financial_record("income", "services", 4000.0, "a")
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        company.add_financial_record("income", "services", 6000.0, "b")
+        company.add_financial_record("expense", "rent", 3000.0, "b")
+        spread_records_across(data_dir, ["2026-01", "2026-01", "2026-02", "2026-02"])
+        result = company.run_scenario(horizon_months=6)
+        assert result["baseline"] == {
+            "months_of_history": 2,
+            "monthly_income": Decimal("5000.00"),
+            "monthly_expense": Decimal("2000.00"),
+            "starting_balance": Decimal("16000.00"),
+        }
+        assert result["assumptions"]["horizon_months"] == 6
+        assert result["assumptions"]["category_changes"] == {}
+        assert len(result["months"]) == 6
+        assert result["summary"]["runway_months"] is None
+        assert result["summary"]["closing_balance"] > 0
+
+    def test_projection_reports_the_month_the_balance_turns_negative(
+        self, company: CompanyWizard
+    ) -> None:
+        company.add_financial_record("income", "services", 1000.0, "a")
+        company.add_financial_record("expense", "payroll", 6000.0, "a")
+        result = company.run_scenario(horizon_months=6)
+        months = result["months"]
+        assert months[0]["opening_balance"] == Decimal("5000.00")
+        assert months[0]["closing_balance"] == Decimal("0.00")
+        assert months[1]["closing_balance"] == Decimal("-5000.00")
+        assert result["summary"]["runway_months"] == 2
+        assert "turns negative in month 2" in " ".join(result["warnings"])
+        assert re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", months[0]["month"])
+
+    def test_runway_is_null_when_the_balance_stays_positive(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        result = company.run_scenario(horizon_months=3)
+        assert result["summary"]["runway_months"] is None
+        assert result["warnings"] == []
+        assert result["summary"]["lowest_balance"] > 0
+        assert result["summary"]["net_change"] > 0
+
+    def test_one_time_expense_hits_the_first_month_only(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        result = company.run_scenario(horizon_months=3, one_time_expense=2000.0)
+        months = result["months"]
+        assert months[0]["expense"] == Decimal("3000.00")
+        assert months[1]["expense"] == Decimal("1000.00")
+        assert months[2]["expense"] == Decimal("1000.00")
+        assert months[0]["net_flow"] == Decimal("2000.00")
+        assert result["summary"]["total_expense"] == Decimal("5000.00")
+        assert result["summary"]["total_income"] == Decimal("15000.00")
+
+    def test_category_changes_add_to_the_monthly_expense(self, company: CompanyWizard) -> None:
+        company.add_financial_record("income", "services", 5000.0, "a")
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        result = company.run_scenario(
+            horizon_months=2, category_changes={"rent": 500.0}, income_change_percent=10.0
+        )
+        assert result["assumptions"]["category_changes"] == {"rent": Decimal("500.00")}
+        assert result["months"][0]["income"] == Decimal("5500.00")
+        assert result["months"][0]["expense"] == Decimal("1500.00")
+        assert result["months"][1]["expense"] == Decimal("1500.00")
+
+    def test_unknown_category_lists_the_valid_ones(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        with pytest.raises(ValueError) as excinfo:
+            company.run_scenario(category_changes={"gyro": 100.0})
+        message = str(excinfo.value)
+        assert "unknown expense category 'gyro'" in message
+        assert "rent" in message
+        assert "payroll" in message
+
+    def test_category_changes_cannot_make_expense_negative(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        with pytest.raises(ValueError, match="would be negative"):
+            company.run_scenario(category_changes={"rent": -5000.0})
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "expected"),
+        [
+            ("horizon_months", 0, "horizon_months must be between 1 and 120"),
+            ("horizon_months", 121, "horizon_months must be between 1 and 120"),
+            ("income_change_percent", -100.5, "between -100 and 10000"),
+            ("expense_change_percent", 10_001, "between -100 and 10000"),
+            ("one_time_expense", -1.0, "must not be negative"),
+        ],
+    )
+    def test_assumption_bounds_are_enforced(
+        self, company: CompanyWizard, argument: str, value: float, expected: str
+    ) -> None:
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            company.run_scenario(**{argument: value})
+
+    def test_scenario_leaves_the_directory_untouched(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.add_financial_record("expense", "rent", 1000.0, "a")
+        before = snapshot(data_dir)
+        entries_before = company.list_audit_entries()["total_entries"]
+        company.run_scenario(horizon_months=4, one_time_expense=500.0)
+        assert snapshot(data_dir) == before
+        assert company.list_audit_entries()["total_entries"] == entries_before
+
+
+class TestRisks:
+    @pytest.mark.parametrize(
+        ("likelihood", "impact", "score", "level"),
+        [
+            ("low", "low", 1, "low"),
+            ("low", "medium", 2, "low"),
+            ("low", "high", 3, "medium"),
+            ("medium", "medium", 4, "medium"),
+            ("high", "medium", 6, "high"),
+            ("high", "high", 9, "critical"),
+        ],
+    )
+    def test_score_and_level_are_derived(
+        self, company: CompanyWizard, likelihood: str, impact: str, score: int, level: str
+    ) -> None:
+        result = company.add_risk("Bir risk", likelihood, impact)
+        assert result["risk"]["score"] == score
+        assert result["risk"]["level"] == level
+        assert result["risk"]["status"] == "open"
+        assert result["risk"]["id"]
+
+    def test_register_file_stores_the_risk_without_derived_fields(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        result = company.add_risk("Kur riski", "high", "high", category="finans", owner="CFO")
+        payload = json.loads((data_dir / "risk_register.json").read_text(encoding="utf-8"))
+        stored = payload["risks"][0]
+        assert stored["id"] == result["risk"]["id"]
+        assert stored["title"] == "Kur riski"
+        assert stored["category"] == "finans"
+        assert "score" not in stored
+        assert "level" not in stored
+
+    @pytest.mark.parametrize("likelihood", ["certain", "HIGH", ""])
+    def test_invalid_ratings_list_the_allowed_ones(
+        self, company: CompanyWizard, likelihood: str
+    ) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            company.add_risk("Risk", likelihood, "low")
+        message = str(excinfo.value)
+        assert "Input should be 'low', 'medium' or 'high'" in message
+        assert repr(likelihood) in message
+
+    def test_empty_title_is_rejected(self, company: CompanyWizard) -> None:
+        with pytest.raises(ValueError, match="non-empty string"):
+            company.add_risk("   ", "low", "low")
+
+    def test_update_changes_values_and_recomputes_the_level(self, company: CompanyWizard) -> None:
+        created = company.add_risk("Tedarikçi riski", "high", "high")
+        risk_id = created["risk"]["id"]
+        result = company.update_risk(
+            risk_id, {"likelihood": "low", "status": "mitigating", "owner": "Ops"}
+        )
+        assert result["changed_fields"] == ["owner", "likelihood", "status"]
+        assert result["risk"]["score"] == 3
+        assert result["risk"]["level"] == "medium"
+        assert result["risk"]["status"] == "mitigating"
+        assert result["risk"]["owner"] == "Ops"
+        assert result["risk"]["title"] == "Tedarikçi riski"
+
+    def test_update_rejects_unknown_fields(self, company: CompanyWizard) -> None:
+        created = company.add_risk("Risk", "low", "low")
+        with pytest.raises(ValueError) as excinfo:
+            company.update_risk(created["risk"]["id"], {"score": "9"})
+        message = str(excinfo.value)
+        assert "unknown field(s): score" in message
+        assert "mitigation" in message
+
+    def test_update_without_an_actual_change_is_refused(self, company: CompanyWizard) -> None:
+        created = company.add_risk("Risk", "low", "high")
+        with pytest.raises(ValueError, match="no changes"):
+            company.update_risk(created["risk"]["id"], {"impact": "high"})
+
+    def test_update_of_an_unknown_id_is_refused(self, company: CompanyWizard) -> None:
+        with pytest.raises(ValueError, match="unknown risk id"):
+            company.update_risk("does-not-exist", {"status": "closed"})
+
+    def test_update_rejects_an_invalid_status(self, company: CompanyWizard) -> None:
+        created = company.add_risk("Risk", "low", "low")
+        with pytest.raises(ValueError, match="open"):
+            company.update_risk(created["risk"]["id"], {"status": "done"})
+
+    def test_delete_removes_the_risk_and_keeps_the_journal(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        created = company.add_risk("Risk", "low", "low")
+        risk_id = created["risk"]["id"]
+        payload = json.loads((data_dir / "risk_register.json").read_text(encoding="utf-8"))
+        assert len(payload["risks"]) == 1
+        result = company.delete_risk(risk_id)
+        assert result["risk"]["id"] == risk_id
+        payload = json.loads((data_dir / "risk_register.json").read_text(encoding="utf-8"))
+        assert payload["risks"] == []
+        actions = {entry["action"] for entry in company.list_audit_entries()["entries"]}
+        assert {"risk_added", "risk_deleted"} <= actions
+        with pytest.raises(ValueError, match="unknown risk id"):
+            company.delete_risk(risk_id)
+
+    def test_list_filters_sorts_and_counts(self, company: CompanyWizard) -> None:
+        company.add_risk("Düşük etki", "low", "low", category="operasyon")
+        company.add_risk("Kritik etki", "high", "high", category="finans")
+        company.add_risk("Orta etki", "medium", "medium", category="finans")
+        listing = company.list_risks()
+        assert [item["title"] for item in listing["risks"]] == [
+            "Kritik etki",
+            "Orta etki",
+            "Düşük etki",
+        ]
+        assert listing["count"] == listing["total_count"] == 3
+        assert listing["open_count"] == 3
+        assert listing["by_level"] == {"critical": 1, "high": 0, "medium": 1, "low": 1}
+        assert listing["categories"] == ["finans", "operasyon"]
+        by_title = company.list_risks(sort="title")
+        assert [item["title"] for item in by_title["risks"]] == [
+            "Düşük etki",
+            "Kritik etki",
+            "Orta etki",
+        ]
+        only_finans = company.list_risks(category="FINANS")
+        assert only_finans["count"] == 2
+        assert only_finans["total_count"] == 3
+
+    def test_status_filter_and_closed_risks_leave_the_open_count(
+        self, company: CompanyWizard
+    ) -> None:
+        first = company.add_risk("Risk A", "low", "low")
+        company.add_risk("Risk B", "high", "high")
+        company.update_risk(first["risk"]["id"], {"status": "closed"})
+        assert company.list_risks()["open_count"] == 1
+        closed = company.list_risks(status="closed")
+        assert closed["count"] == 1
+        assert [item["title"] for item in closed["risks"]] == ["Risk A"]
+
+    @pytest.mark.parametrize("filters", [{"status": "unknown"}, {"sort": "urgency"}])
+    def test_invalid_list_options(self, company: CompanyWizard, filters: dict[str, str]) -> None:
+        with pytest.raises(ValueError):
+            company.list_risks(**filters)
+
+    def test_register_is_read_back_from_disk(self, company: CompanyWizard) -> None:
+        company.add_risk("Kalıcı risk", "medium", "high", mitigation="İkinci tedarikçi")
+        reloaded = CompanyWizard(company.file_handler).list_risks()
+        assert reloaded["count"] == 1
+        assert reloaded["risks"][0]["mitigation"] == "İkinci tedarikçi"
+        assert reloaded["risks"][0]["level"] == "high"

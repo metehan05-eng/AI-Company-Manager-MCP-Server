@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Append-only audit trail**: every mutating tool journals one entry to
+  `company_data/audit_log.json` before the data itself is written. A failed data write
+  removes the entry again (journal-first / rollback), so the log only describes changes that
+  are on disk. Entries carry a gapless `seq`, an `action`, a `target` (file and record id), a
+  one-line `summary`, `details` with before/after values (long strings clipped to 500
+  characters) and a UTC `timestamp`. `list_audit_entries` reads them newest first with
+  `limit`/`offset` paging and an optional `action` filter; unknown actions or limits are
+  errors that explain what exists. Each change already on disk can be audited from
+  initialization through notes, migration backups and risk edits, and dry-run/read-only calls
+  never add an entry.
+- `get_variance_report` tool: a read-only month-by-month look at the ledger against the plan.
+  Groups records by `YYYY-MM`, reports `initial_budget`, `spent`, `remaining`, `over_budget`
+  and `used_percent`, and compares every month with the one before it (absolute change and
+  one-decimal percentage, `null` when there is no base). Pass `month` for a single row; an
+  unknown month lists the available ones.
+- `run_scenario` tool: a read-only "what-if" projection. The baseline is the historical
+  monthly average; each projected month applies income/expense percentages, fixed
+  `category_changes` per expense category and a one-time expense in month 1. Returns every
+  projected month with opening/closing balances and a `summary` whose `runway_months` is the
+  month the balance first turns negative (`null` if it never does). Refuses scenarios without
+  records and projections that would make the monthly expense negative. Nothing is written,
+  not even a journal entry.
+- Risk register tools: `add_risk`, `update_risk`, `list_risks` and `delete_risk` manage
+  `company_data/risk_register.json`. Severity is derived as `likelihood × impact` (1-3 each)
+  into a 1-9 score and a `low`/`medium`/`high`/`critical` level that is computed on read and
+  never stored. `update_risk` accepts only the editable fields and refuses no-op changes;
+  `list_risks` filters by `status` (`open`/`mitigating`/`closed`) and `category` and sorts by
+  score, creation date or title, with counts per level. Deletions remain visible in the audit
+  journal.
 - `read_company_file` gained a character budget and PDF page selection. Output is
   capped at `max_chars` characters (default `100_000`, configured by
   `COMPANY_READ_MAX_CHARS`), and the response reports `total_chars`, `start_char`,

@@ -166,6 +166,23 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _format_month(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def _shift_month(anchor: date, months: int) -> date:
+    """Move a first-of-month date by a whole number of months."""
+    total = anchor.year * 12 + (anchor.month - 1) + months
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _percent_change(current: Decimal, previous: Decimal) -> float | None:
+    """Percentage moved from `previous` to `current`, or None when there is no base."""
+    if previous == 0:
+        return None
+    return float(((current - previous) / previous * 100).quantize(Decimal("0.1")))
+
+
 def _clean_required_text(value: str, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
@@ -703,6 +720,100 @@ class CompanyNotes(BaseModel):
     updated_at: datetime = Field(default_factory=_utc_now)
 
 
+class AuditEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    seq: int = Field(ge=1)
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    action: str = Field(min_length=1, max_length=100)
+    target: str = Field(min_length=1, max_length=300)
+    summary: str = Field(min_length=1, max_length=500)
+    details: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=_utc_now)
+
+
+class AuditLog(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    entries: list[AuditEntry] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+
+RiskRating = Literal["low", "medium", "high"]
+RiskStatus = Literal["open", "mitigating", "closed"]
+RiskLevel = Literal["low", "medium", "high", "critical"]
+
+RISK_RATING_SCORE: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
+RISK_EDITABLE_FIELDS = (
+    "title",
+    "description",
+    "category",
+    "owner",
+    "mitigation",
+    "likelihood",
+    "impact",
+    "status",
+)
+
+
+def _risk_score(likelihood: RiskRating, impact: RiskRating) -> int:
+    return RISK_RATING_SCORE[likelihood] * RISK_RATING_SCORE[impact]
+
+
+def _risk_level(score: int) -> RiskLevel:
+    if score >= 7:
+        return "critical"
+    if score >= 5:
+        return "high"
+    if score >= 3:
+        return "medium"
+    return "low"
+
+
+class Risk(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=4_000)
+    category: str = Field(default="general", min_length=1, max_length=100)
+    owner: str = Field(default="", max_length=200)
+    mitigation: str = Field(default="", max_length=4_000)
+    likelihood: RiskRating
+    impact: RiskRating
+    status: RiskStatus = "open"
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+    @field_validator("title", "category", mode="before")
+    @classmethod
+    def clean_risk_text(cls, value: str) -> str:
+        return _clean_required_text(value, "risk text")
+
+    @property
+    def score(self) -> int:
+        return _risk_score(self.likelihood, self.impact)
+
+    @property
+    def level(self) -> RiskLevel:
+        return _risk_level(self.score)
+
+
+def _risk_payload(risk: Risk) -> dict[str, Any]:
+    """Serialize a risk with its derived score and level, which are never stored."""
+    payload = risk.model_dump(mode="json")
+    payload["score"] = risk.score
+    payload["level"] = risk.level
+    return payload
+
+
+class RiskRegister(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    risks: list[Risk] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+
 class CompanyWizard:
     def __init__(self, file_handler: FileHandler | None = None) -> None:
         self.file_handler = file_handler or FileHandler()
@@ -721,6 +832,59 @@ class CompanyWizard:
 
     def _read_model(self, filename: str, model_type: type[BaseModel]) -> Any:
         return model_type.model_validate_json(self.file_handler.read_file(filename))
+
+    def _load_audit(self) -> AuditLog:
+        try:
+            return self._read_model("audit_log.json", AuditLog)
+        except FileNotFoundError:
+            return AuditLog()
+
+    @classmethod
+    def _audit_value(cls, value: Any, limit: int = 500) -> Any:
+        """Keep audit details readable: long strings are clipped instead of stored whole."""
+        if isinstance(value, str):
+            return value if len(value) <= limit else value[: limit - 1] + "…"
+        if isinstance(value, dict):
+            return {key: cls._audit_value(item, limit) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._audit_value(item, limit) for item in value]
+        return value
+
+    def _commit(
+        self,
+        action: str,
+        target: str,
+        summary: str,
+        details: dict[str, Any],
+        write: Callable[[], None],
+    ) -> None:
+        """Journal a change first, then apply it, rolling the entry back if the write fails.
+
+        Journaling before the data write keeps the log from claiming a change that never
+        landed; a failed write removes the entry again, so the log only ever describes
+        changes that are on disk. The lock is reentrant, so this is safe to call from
+        methods that already hold it.
+        """
+        with self._lock:
+            log = self._load_audit()
+            entry = AuditEntry(
+                seq=len(log.entries) + 1,
+                action=action,
+                target=target,
+                summary=summary,
+                details={key: self._audit_value(value) for key, value in details.items()},
+            )
+            log.entries.append(entry)
+            log.updated_at = _utc_now()
+            self._write_model("audit_log.json", log)
+            try:
+                write()
+            except Exception:
+                log.entries.pop()
+                log.updated_at = _utc_now()
+                with contextlib.suppress(Exception):
+                    self._write_model("audit_log.json", log)
+                raise
 
     def _existing_template_can_be_replaced(self) -> bool:
         profile_path = self.file_handler.data_dir / "company_profile.json"
@@ -812,18 +976,37 @@ class CompanyWizard:
                 path = self.file_handler.data_dir / filename
                 if path.exists():
                     existing_contents[filename] = path.read_text(encoding="utf-8-sig")
-            try:
-                self._write_model("company_profile.json", profile)
-                self._write_model("financials.json", financials)
-                self.file_handler.write_file("employees.csv", employees)
-            except Exception:
-                for filename in core_files:
-                    if filename in existing_contents:
-                        with contextlib.suppress(OSError, TypeError, ValueError):
-                            self.file_handler.write_file(filename, existing_contents[filename])
-                    else:
-                        (self.file_handler.data_dir / filename).unlink(missing_ok=True)
-                raise
+
+            def _write_core_files() -> None:
+                try:
+                    self._write_model("company_profile.json", profile)
+                    self._write_model("financials.json", financials)
+                    self.file_handler.write_file("employees.csv", employees)
+                except Exception:
+                    for filename in core_files:
+                        if filename in existing_contents:
+                            with contextlib.suppress(OSError, TypeError, ValueError):
+                                self.file_handler.write_file(filename, existing_contents[filename])
+                        else:
+                            (self.file_handler.data_dir / filename).unlink(missing_ok=True)
+                    raise
+
+            self._commit(
+                action="company_initialized",
+                target="company_profile.json",
+                summary=(
+                    f"Initialized company {profile.company_name} "
+                    f"with an initial budget of {budget_value}"
+                ),
+                details={
+                    "company_name": profile.company_name,
+                    "sector": profile.sector,
+                    "currency": profile.currency,
+                    "initial_budget": budget_value,
+                    "created_files": list(core_files),
+                },
+                write=_write_core_files,
+            )
 
         return {
             "message": "Company initialized successfully",
@@ -872,11 +1055,26 @@ class CompanyWizard:
                 categories = financials.revenue_categories
             else:
                 categories = financials.expense_categories
-            if not any(item.casefold() == record.category.casefold() for item in categories):
+            category_added = not any(
+                item.casefold() == record.category.casefold() for item in categories
+            )
+            if category_added:
                 categories.append(record.category)
             financials.records.append(record)
             financials.updated_at = _utc_now()
-            self._write_model("financials.json", financials)
+            self._commit(
+                action="financial_record_added",
+                target=f"financials.json:{record.id}",
+                summary=(
+                    f"Added {record.type} record of {record.amount} "
+                    f"{financials.currency} under {record.category}"
+                ),
+                details={
+                    "record": record.model_dump(mode="json"),
+                    "category_added": category_added,
+                },
+                write=lambda: self._write_model("financials.json", financials),
+            )
 
         return {
             "message": "Financial record added successfully",
@@ -959,7 +1157,19 @@ class CompanyWizard:
                 [frame, new_row[frame.columns]],
                 ignore_index=True,
             )
-            self.file_handler.write_file("employees.csv", updated_frame)
+
+            def _write_employees() -> None:
+                self.file_handler.write_file("employees.csv", updated_frame)
+
+            self._commit(
+                action="employee_added",
+                target=f"employees.csv:{employee.employee_id}",
+                summary=(
+                    f"Added employee {employee.name} as {employee.role} in {employee.department}"
+                ),
+                details={"employee": employee.model_dump(mode="json")},
+                write=_write_employees,
+            )
 
         return {
             "message": "Employee added successfully",
@@ -1105,8 +1315,22 @@ class CompanyWizard:
 
         stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
         backup_name = f"employees.backup-{stamp}.csv"
-        self.file_handler.write_file(backup_name, raw)
-        self.file_handler.write_file("employees.csv", canonical)
+
+        def _write_migration() -> None:
+            self.file_handler.write_file(backup_name, raw)
+            self.file_handler.write_file("employees.csv", canonical)
+
+        self._commit(
+            action="employees_migrated",
+            target="employees.csv",
+            summary=f"Migrated employees.csv to the current schema ({len(canonical)} rows)",
+            details={
+                "row_count": len(canonical),
+                "backup_file": backup_name,
+                "renamed_columns": result["renamed_columns"],
+            },
+            write=_write_migration,
+        )
         result["applied"] = True
         result["backup_file"] = backup_name
         result["message"] = "employees.csv migrated successfully"
@@ -1525,20 +1749,40 @@ class CompanyWizard:
 
         stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
         backups: dict[str, str] = result["backups"]
-        for name in changed:
-            backup_name = name.replace(".json", f".backup-{stamp}.json")
-            self.file_handler.write_file(
-                backup_name, (self.file_handler.data_dir / name).read_text(encoding="utf-8")
-            )
-            backups[name] = backup_name
-        for name, model_type in models.items():
-            self._write_model(name, model_type.model_validate(documents[name]))
-        result["backups"] = backups
-        result["message"] = (
-            "company_profile.json and financials.json migrated successfully"
-            if changed
-            else "Both files already matched; nothing was written."
+        backup_plan = {name: name.replace(".json", f".backup-{stamp}.json") for name in changed}
+
+        if not changed:
+            for name, model_type in models.items():
+                self._write_model(name, model_type.model_validate(documents[name]))
+            result["message"] = "Both files already matched; nothing was written."
+            return result
+
+        def _write_documents() -> None:
+            for name, backup_name in backup_plan.items():
+                self.file_handler.write_file(
+                    backup_name,
+                    (self.file_handler.data_dir / name).read_text(encoding="utf-8"),
+                )
+                backups[name] = backup_name
+            for name, model_type in models.items():
+                self._write_model(name, model_type.model_validate(documents[name]))
+
+        self._commit(
+            action="data_migration_applied",
+            target=", ".join(changed),
+            summary=(
+                f"Applied the confirmed mapping to {len(changed)} file(s) "
+                "with a timestamped backup each"
+            ),
+            details={
+                "changed_files": changed,
+                "backups": backup_plan,
+                "resolved": result["resolved"],
+            },
+            write=_write_documents,
         )
+        result["backups"] = backups
+        result["message"] = "company_profile.json and financials.json migrated successfully"
         return result
 
     def update_company_notes(self, note_title: str, content: str) -> dict[str, Any]:
@@ -1553,16 +1797,36 @@ class CompanyWizard:
                 (note for note in notes.notes if note.title.casefold() == title.casefold()),
                 None,
             )
+            previous_content: str | None
             if existing_note is None:
                 existing_note = CompanyNote(title=title, content=clean_content)
                 notes.notes.append(existing_note)
                 action = "created"
+                previous_content = None
             else:
+                previous_content = existing_note.content
                 existing_note.content = clean_content
                 existing_note.updated_at = _utc_now()
                 action = "updated"
             notes.updated_at = _utc_now()
-            self._write_model("company_notes.json", notes)
+            details: dict[str, Any] = {
+                "note_id": existing_note.id,
+                "title": title,
+                "content_length_before": (
+                    len(previous_content) if previous_content is not None else None
+                ),
+                "content_length_after": len(clean_content),
+            }
+            if previous_content is not None:
+                details["content_before"] = previous_content
+                details["content_after"] = clean_content
+            self._commit(
+                action=f"note_{action}",
+                target=f"company_notes.json:{existing_note.id}",
+                summary=f"Company note {action}: {title}",
+                details=details,
+                write=lambda: self._write_model("company_notes.json", notes),
+            )
 
         return {
             "message": f"Company note {action} successfully",
@@ -1659,6 +1923,425 @@ class CompanyWizard:
             "warnings": warnings,
         }
 
+    def list_audit_entries(
+        self,
+        action: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Read the append-only change journal, newest entry first. Read-only."""
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        wanted = action.strip() if isinstance(action, str) and action.strip() else None
+        with self._lock:
+            log = self._load_audit()
+
+        available = sorted({entry.action for entry in log.entries})
+        if wanted is not None and wanted not in available:
+            listed = ", ".join(repr(name) for name in available) or "none"
+            raise ValueError(f"unknown action {wanted!r}. Available actions: {listed}")
+
+        newest_first = list(reversed(log.entries))
+        if wanted is not None:
+            newest_first = [entry for entry in newest_first if entry.action == wanted]
+        filtered_total = len(newest_first)
+        page = newest_first[offset : offset + limit]
+        return {
+            "entries": [entry.model_dump(mode="json") for entry in page],
+            "total_entries": len(log.entries),
+            "filtered_total": filtered_total,
+            "action_filter": wanted,
+            "actions": available,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < filtered_total,
+        }
+
+    def get_variance_report(self, month: str | None = None) -> dict[str, Any]:
+        """Compare spending against the budget and each month against the last. Read-only."""
+        wanted = month.strip() if isinstance(month, str) and month.strip() else None
+        if wanted is not None and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", wanted) is None:
+            raise ValueError(f"month {wanted!r} must be formatted as YYYY-MM, for example 2026-10")
+        with self._lock:
+            financials = self._read_model("financials.json", CompanyFinancials)
+
+        monthly: dict[str, dict[str, Decimal]] = {}
+        for record in financials.records:
+            key = _format_month(record.recorded_at.year, record.recorded_at.month)
+            bucket = monthly.setdefault(
+                key, {"income": Decimal("0.00"), "expense": Decimal("0.00")}
+            )
+            bucket[record.type] += record.amount
+        available_months = sorted(monthly)
+        if wanted is not None and wanted not in monthly:
+            listed = ", ".join(available_months) or "none"
+            raise ValueError(f"unknown month {wanted!r}. Available months: {listed}")
+
+        rows: list[dict[str, Any]] = []
+        previous: dict[str, Decimal] | None = None
+        for key in available_months:
+            current = monthly[key]
+            current_net = current["income"] - current["expense"]
+            change: dict[str, Any] | None = None
+            change_percent: dict[str, Any] | None = None
+            if previous is not None:
+                previous_net = previous["income"] - previous["expense"]
+                change = {
+                    "income": current["income"] - previous["income"],
+                    "expense": current["expense"] - previous["expense"],
+                    "net": current_net - previous_net,
+                }
+                change_percent = {
+                    "income": _percent_change(current["income"], previous["income"]),
+                    "expense": _percent_change(current["expense"], previous["expense"]),
+                    "net": _percent_change(current_net, previous_net),
+                }
+            rows.append(
+                {
+                    "month": key,
+                    "income": current["income"],
+                    "expense": current["expense"],
+                    "net": current_net,
+                    "change_vs_previous": change,
+                    "change_percent_vs_previous": change_percent,
+                }
+            )
+            previous = {**current, "net": current_net}
+        returned = [row for row in rows if row["month"] == wanted] if wanted else rows
+
+        total_expenses = financials.total_expenses
+        over_budget = total_expenses > financials.initial_budget
+        remaining = financials.initial_budget - total_expenses
+        warnings: list[str] = []
+        if financials.current_balance < 0:
+            warnings.append(f"current balance is negative: {financials.current_balance}")
+        if over_budget:
+            warnings.append(
+                f"total expenses {total_expenses} exceed the initial budget "
+                f"{financials.initial_budget}"
+            )
+        if not financials.records:
+            warnings.append("no financial records to compare yet")
+
+        return {
+            "company_name": financials.company_name,
+            "currency": financials.currency,
+            "generated_at": _utc_now().isoformat(),
+            "month_filter": wanted,
+            "budget": {
+                "initial_budget": financials.initial_budget,
+                "spent": total_expenses,
+                "remaining": remaining,
+                "over_budget": over_budget,
+                "used_percent": (
+                    float(
+                        (total_expenses / financials.initial_budget * 100).quantize(Decimal("0.1"))
+                    )
+                    if financials.initial_budget
+                    else None
+                ),
+            },
+            "monthly": returned,
+            "month_count": len(rows),
+            "record_count": len(financials.records),
+            "warnings": warnings,
+        }
+
+    def run_scenario(
+        self,
+        horizon_months: int = 12,
+        income_change_percent: float = 0.0,
+        expense_change_percent: float = 0.0,
+        category_changes: dict[str, float] | None = None,
+        one_time_expense: float = 0.0,
+    ) -> dict[str, Any]:
+        """Project the balance forward under stated assumptions. Read-only: nothing is saved.
+
+        The baseline is the historical monthly average of every recorded month.
+        `category_changes` adds (or removes) a fixed monthly amount per expense category;
+        `one_time_expense` is charged once, in the first projected month.
+        """
+        if horizon_months < 1 or horizon_months > 120:
+            raise ValueError("horizon_months must be between 1 and 120")
+        for name, value in (
+            ("income_change_percent", income_change_percent),
+            ("expense_change_percent", expense_change_percent),
+        ):
+            if value < -100 or value > 10_000:
+                raise ValueError(f"{name} must be between -100 and 10000")
+        one_time = _normalize_money(one_time_expense, "one_time_expense")
+        if one_time < 0:
+            raise ValueError("one_time_expense must not be negative")
+
+        deltas: dict[str, Decimal] = {}
+        if category_changes:
+            with self._lock:
+                financials = self._read_model("financials.json", CompanyFinancials)
+            known = {name.casefold(): name for name in financials.expense_categories}
+            for raw_name, raw_value in category_changes.items():
+                name = _clean_required_text(raw_name, "category_changes key")
+                canonical = known.get(name.casefold())
+                if canonical is None:
+                    listed = ", ".join(financials.expense_categories)
+                    raise ValueError(f"unknown expense category {name!r}. Available: {listed}")
+                deltas[canonical] = deltas.get(canonical, Decimal("0.00")) + _normalize_money(
+                    raw_value, f"category_changes[{name!r}]"
+                )
+        else:
+            with self._lock:
+                financials = self._read_model("financials.json", CompanyFinancials)
+
+        history: dict[str, dict[str, Decimal]] = {}
+        for record in financials.records:
+            key = _format_month(record.recorded_at.year, record.recorded_at.month)
+            bucket = history.setdefault(
+                key, {"income": Decimal("0.00"), "expense": Decimal("0.00")}
+            )
+            bucket[record.type] += record.amount
+        if not history:
+            raise ValueError(
+                "a scenario needs at least one income or expense record; "
+                "add records with add_financial_record first"
+            )
+
+        observed_months = Decimal(len(history))
+        baseline_income = (
+            sum((bucket["income"] for bucket in history.values()), Decimal("0.00"))
+            / observed_months
+        ).quantize(Decimal("0.01"))
+        baseline_expense = (
+            sum((bucket["expense"] for bucket in history.values()), Decimal("0.00"))
+            / observed_months
+        ).quantize(Decimal("0.01"))
+
+        income_factor = 1 + Decimal(str(income_change_percent)) / 100
+        expense_factor = 1 + Decimal(str(expense_change_percent)) / 100
+        monthly_income = (baseline_income * income_factor).quantize(Decimal("0.01"))
+        monthly_expense = (
+            baseline_expense * expense_factor + sum(deltas.values(), Decimal("0.00"))
+        ).quantize(Decimal("0.01"))
+        if monthly_expense < 0:
+            raise ValueError(
+                f"projected monthly expense would be negative ({monthly_expense}); "
+                "reduce the category_changes amounts"
+            )
+
+        starting_balance = financials.current_balance
+        anchor = _utc_today().replace(day=1)
+        opening = starting_balance
+        months: list[dict[str, Any]] = []
+        total_income = Decimal("0.00")
+        total_expense = Decimal("0.00")
+        lowest = starting_balance
+        runway_months: int | None = None
+        for index in range(1, horizon_months + 1):
+            label = _shift_month(anchor, index - 1)
+            expense = monthly_expense + (one_time if index == 1 else Decimal("0.00"))
+            closing = opening + monthly_income - expense
+            if runway_months is None and closing < 0:
+                runway_months = index
+            if closing < lowest:
+                lowest = closing
+            months.append(
+                {
+                    "month_index": index,
+                    "month": _format_month(label.year, label.month),
+                    "opening_balance": opening,
+                    "income": monthly_income,
+                    "expense": expense,
+                    "net_flow": monthly_income - expense,
+                    "closing_balance": closing,
+                }
+            )
+            total_income += monthly_income
+            total_expense += expense
+            opening = closing
+
+        warnings: list[str] = []
+        if starting_balance < 0:
+            warnings.append(f"starting balance is already negative: {starting_balance}")
+        if runway_months is not None:
+            warnings.append(
+                f"balance turns negative in month {runway_months} "
+                f"({months[runway_months - 1]['month']})"
+            )
+
+        return {
+            "company_name": financials.company_name,
+            "currency": financials.currency,
+            "generated_at": _utc_now().isoformat(),
+            "baseline": {
+                "months_of_history": len(history),
+                "monthly_income": baseline_income,
+                "monthly_expense": baseline_expense,
+                "starting_balance": starting_balance,
+            },
+            "assumptions": {
+                "horizon_months": horizon_months,
+                "income_change_percent": income_change_percent,
+                "expense_change_percent": expense_change_percent,
+                "category_changes": dict(deltas),
+                "one_time_expense": one_time,
+            },
+            "months": months,
+            "summary": {
+                "closing_balance": opening,
+                "total_income": total_income,
+                "total_expense": total_expense,
+                "net_change": opening - starting_balance,
+                "lowest_balance": lowest,
+                "runway_months": runway_months,
+            },
+            "warnings": warnings,
+        }
+
+    def _read_register(self) -> RiskRegister:
+        try:
+            return self._read_model("risk_register.json", RiskRegister)
+        except FileNotFoundError:
+            return RiskRegister()
+
+    def list_risks(
+        self,
+        status: str | None = None,
+        category: str | None = None,
+        sort: str = "score",
+    ) -> dict[str, Any]:
+        """List registered risks with their severity. Read-only."""
+        wanted_status = status.strip() if isinstance(status, str) and status.strip() else None
+        if wanted_status is not None and wanted_status not in ("open", "mitigating", "closed"):
+            raise ValueError("status must be 'open', 'mitigating' or 'closed'")
+        if sort not in ("score", "created", "title"):
+            raise ValueError("sort must be 'score', 'created' or 'title'")
+        wanted_category = (
+            category.strip() if isinstance(category, str) and category.strip() else None
+        )
+        with self._lock:
+            register = self._read_register()
+
+        selected = list(register.risks)
+        if wanted_status is not None:
+            selected = [risk for risk in selected if risk.status == wanted_status]
+        if wanted_category is not None:
+            selected = [
+                risk for risk in selected if risk.category.casefold() == wanted_category.casefold()
+            ]
+        if sort == "score":
+            selected.sort(key=lambda risk: (-risk.score, risk.title.casefold()))
+        elif sort == "created":
+            selected.sort(key=lambda risk: risk.created_at, reverse=True)
+        else:
+            selected.sort(key=lambda risk: risk.title.casefold())
+
+        by_level: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for risk in register.risks:
+            by_level[risk.level] += 1
+        return {
+            "risks": [_risk_payload(risk) for risk in selected],
+            "count": len(selected),
+            "total_count": len(register.risks),
+            "open_count": sum(1 for risk in register.risks if risk.status != "closed"),
+            "by_level": by_level,
+            "categories": sorted({risk.category for risk in register.risks}, key=str.casefold),
+            "sort": sort,
+            "generated_at": _utc_now().isoformat(),
+        }
+
+    def add_risk(
+        self,
+        title: str,
+        likelihood: str,
+        impact: str,
+        description: str = "",
+        category: str = "general",
+        owner: str = "",
+        mitigation: str = "",
+    ) -> dict[str, Any]:
+        risk = Risk(
+            title=title,
+            likelihood=likelihood,
+            impact=impact,
+            description=description,
+            category=category,
+            owner=owner,
+            mitigation=mitigation,
+        )
+        with self._lock:
+            register = self._read_register()
+            register.risks.append(risk)
+            register.updated_at = _utc_now()
+            self._commit(
+                action="risk_added",
+                target=f"risk_register.json:{risk.id}",
+                summary=f"Added risk {risk.title} ({risk.level}, score {risk.score})",
+                details={"risk": _risk_payload(risk)},
+                write=lambda: self._write_model("risk_register.json", register),
+            )
+        return {"message": "Risk added successfully", "risk": _risk_payload(risk)}
+
+    def update_risk(self, risk_id: str, changes: dict[str, str]) -> dict[str, Any]:
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must not be empty")
+        editable = set(RISK_EDITABLE_FIELDS)
+        unknown = sorted(key for key in changes if key not in editable)
+        if unknown:
+            raise ValueError(
+                f"unknown field(s): {', '.join(str(key) for key in unknown)}. "
+                f"Editable fields: {', '.join(RISK_EDITABLE_FIELDS)}"
+            )
+        with self._lock:
+            register = self._read_register()
+            risk = next((item for item in register.risks if item.id == risk_id), None)
+            if risk is None:
+                raise ValueError(f"unknown risk id {risk_id!r}; call list_risks to see ids")
+            before = _risk_payload(risk)
+            for field, value in changes.items():
+                setattr(risk, field, value)
+            risk.updated_at = _utc_now()
+            after = _risk_payload(risk)
+            changed = [field for field in RISK_EDITABLE_FIELDS if before[field] != after[field]]
+            if not changed:
+                raise ValueError(
+                    f"no changes: the provided values already match this risk ({risk.title})"
+                )
+            register.updated_at = _utc_now()
+            self._commit(
+                action="risk_updated",
+                target=f"risk_register.json:{risk.id}",
+                summary=f"Updated risk {risk.title}: {', '.join(changed)}",
+                details={
+                    "risk_id": risk.id,
+                    "changed_fields": changed,
+                    "before": {field: before[field] for field in changed},
+                    "after": {field: after[field] for field in changed},
+                },
+                write=lambda: self._write_model("risk_register.json", register),
+            )
+        return {
+            "message": "Risk updated successfully",
+            "risk": after,
+            "changed_fields": changed,
+        }
+
+    def delete_risk(self, risk_id: str) -> dict[str, Any]:
+        with self._lock:
+            register = self._read_register()
+            risk = next((item for item in register.risks if item.id == risk_id), None)
+            if risk is None:
+                raise ValueError(f"unknown risk id {risk_id!r}; call list_risks to see ids")
+            register.risks.remove(risk)
+            register.updated_at = _utc_now()
+            self._commit(
+                action="risk_deleted",
+                target=f"risk_register.json:{risk.id}",
+                summary=f"Deleted risk {risk.title} ({risk.level}, score {risk.score})",
+                details={"risk": _risk_payload(risk)},
+                write=lambda: self._write_model("risk_register.json", register),
+            )
+        return {"message": "Risk deleted successfully", "risk": _risk_payload(risk)}
+
 
 default_company_wizard = CompanyWizard()
 
@@ -1691,3 +2374,67 @@ def update_company_notes(note_title: str, content: str) -> dict[str, Any]:
 
 def get_company_overview() -> dict[str, Any]:
     return default_company_wizard.get_company_overview()
+
+
+def list_audit_entries(
+    action: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return default_company_wizard.list_audit_entries(action=action, limit=limit, offset=offset)
+
+
+def get_variance_report(month: str | None = None) -> dict[str, Any]:
+    return default_company_wizard.get_variance_report(month=month)
+
+
+def run_scenario(
+    horizon_months: int = 12,
+    income_change_percent: float = 0.0,
+    expense_change_percent: float = 0.0,
+    category_changes: dict[str, float] | None = None,
+    one_time_expense: float = 0.0,
+) -> dict[str, Any]:
+    return default_company_wizard.run_scenario(
+        horizon_months=horizon_months,
+        income_change_percent=income_change_percent,
+        expense_change_percent=expense_change_percent,
+        category_changes=category_changes,
+        one_time_expense=one_time_expense,
+    )
+
+
+def list_risks(
+    status: str | None = None,
+    category: str | None = None,
+    sort: str = "score",
+) -> dict[str, Any]:
+    return default_company_wizard.list_risks(status=status, category=category, sort=sort)
+
+
+def add_risk(
+    title: str,
+    likelihood: str,
+    impact: str,
+    description: str = "",
+    category: str = "general",
+    owner: str = "",
+    mitigation: str = "",
+) -> dict[str, Any]:
+    return default_company_wizard.add_risk(
+        title,
+        likelihood,
+        impact,
+        description=description,
+        category=category,
+        owner=owner,
+        mitigation=mitigation,
+    )
+
+
+def update_risk(risk_id: str, changes: dict[str, str]) -> dict[str, Any]:
+    return default_company_wizard.update_risk(risk_id, changes)
+
+
+def delete_risk(risk_id: str) -> dict[str, Any]:
+    return default_company_wizard.delete_risk(risk_id)

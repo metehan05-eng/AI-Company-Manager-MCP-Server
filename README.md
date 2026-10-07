@@ -28,6 +28,9 @@ Installs with a single command and runs on Windows, Linux and macOS.
 - [MCP Tools](#mcp-tools)
 - [Example Client Calls](#example-client-calls)
 - [Financial Report](#financial-report)
+- [Audit Trail](#audit-trail)
+- [Variance and Scenario Reporting](#variance-and-scenario-reporting)
+- [Risk Register](#risk-register)
 - [Data Layout](#data-layout)
 - [Using an Existing `employees.csv`](#using-an-existing-employeescsv)
 - [Mapping an Existing Profile and Ledger](#mapping-an-existing-profile-and-ledger)
@@ -62,6 +65,12 @@ the data at any time with your favorite tools.
 - **Financial tracking:** income/expense records, automatic cash flow summary, current balance
 - **Employee management:** validated employee records with automatic `EMP-0001` style IDs
 - **Company notes:** create or update policy, meeting, strategy or vision notes by title
+- **Append-only audit trail:** every change is journaled with its before/after values before
+  the data is written, and a failed write removes the entry again
+- **Variance and scenario reporting:** budget usage, month-over-month movement and
+  read-only balance projections with a runway estimate
+- **Risk register:** scored risks (`likelihood × impact`), severity levels, owners and
+  mitigations, filterable and sortable
 - **Multiple file formats:** read/write TXT, MD, JSON, CSV and XLSX; **read PDF and DOCX**
 - **Atomic file writes** and strict path boundaries (symlinks and `..` are rejected)
 - **Formula injection protection:** leading `=`, `+`, `-` and `@` characters are neutralized in
@@ -292,6 +301,13 @@ OpenCode only reads its settings at startup, so restart it after editing.
 | `migrate_company_data` | Converts an existing `employees.csv` to the current column schema. | — (`apply` defaults to `false`) |
 | `plan_company_data_migration` | Proposes a field mapping for an existing `company_profile.json` and `financials.json`. Read-only. | — |
 | `apply_company_data_migration` | Writes the mapping you confirmed. Answers every open item first. | — (`apply` defaults to `false`) |
+| `list_audit_entries` | Reads the append-only change journal, newest first. Read-only. | — (`action`, `limit`, `offset` are optional) |
+| `get_variance_report` | Budget usage and month-over-month income/expense movement. Read-only. | — (`month` is optional) |
+| `run_scenario` | Projects the balance forward under stated assumptions. Simulates only; nothing is saved. | — (`horizon_months`, `income_change_percent`, `expense_change_percent`, `category_changes`, `one_time_expense` are optional) |
+| `list_risks` | Lists registered risks with score, level and status. Read-only. | — (`status`, `category`, `sort` are optional) |
+| `add_risk` | Registers a risk scored from its likelihood and impact. | `title`, `likelihood`, `impact` (`description`, `category`, `owner`, `mitigation` are optional) |
+| `update_risk` | Changes the given fields of an existing risk and rescores it. | `risk_id`, `changes` |
+| `delete_risk` | Removes a risk from the register; the deletion stays in the journal. | `risk_id` |
 
 All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
 record or a description longer than 2,000 characters is rejected.
@@ -367,6 +383,88 @@ lists the available ones rather than an empty table.
 {"tool": "get_financial_report", "arguments": {"period": "2025-Q1"}}
 ```
 
+## Audit Trail
+
+Every mutating tool writes one entry to `company_data/audit_log.json` **before** the data
+itself is written, and removes it again if the write fails. The log therefore only ever
+describes changes that are on disk: an entry is evidence the change landed, never a promise
+that it might. Read-only tools such as `get_variance_report` and `run_scenario` never add
+one.
+
+| Field | Meaning |
+|---|---|
+| `seq` | Gapless counter starting at 1; a missing number means an entry was removed. |
+| `action` | What happened, for example `financial_record_added` or `risk_updated`. |
+| `target` | The file and, where one exists, the record id (`financials.json:<uuid>`). |
+| `summary` | One human-readable line describing the change. |
+| `details` | Before/after values, ids, category flags and backup names. Long strings are clipped to 500 characters. |
+| `timestamp` | UTC time of the change. |
+
+`list_audit_entries` returns the entries newest first and pages with `limit` (1-500) and
+`offset`. Pass `action` to filter; an unknown action lists the ones that exist instead of
+returning an empty page.
+
+```json
+{"tool": "list_audit_entries", "arguments": {}}
+{"tool": "list_audit_entries", "arguments": {"action": "financial_record_added", "limit": 10}}
+```
+
+## Variance and Scenario Reporting
+
+`get_variance_report` answers "how did we actually do against the plan?". It groups the
+ledger by month (`YYYY-MM`, from each record's `recorded_at`), reports budget usage and
+compares every month with the one before it.
+
+| Block | Contents |
+|---|---|
+| `budget` | `initial_budget`, `spent`, `remaining`, `over_budget` and `used_percent`. |
+| `monthly` | One row per month with `income`, `expense`, `net`, `change_vs_previous` (absolute) and `change_percent_vs_previous`. |
+| `warnings` | A negative balance, expenses above the initial budget, or an empty ledger. |
+
+Percentages are one decimal and `null` when there is no base to divide by - the first month
+never has a previous month, and a month whose net is compared against a zero net has no
+percentage either. Pass `month` (`YYYY-MM`) for a single row; an unknown month lists the
+months the ledger actually contains.
+
+`run_scenario` answers "what happens if ...?" and writes nothing at all. The baseline is the
+historical monthly average of every recorded month; each projected month then applies
+`income_change_percent`, `expense_change_percent` and any fixed `category_changes` per
+expense category, charging `one_time_expense` once in the first month. The result carries
+every projected month with its opening and closing balance, plus a `summary` whose
+`runway_months` is the month the balance first turns negative (`null` when it never does
+inside the horizon).
+
+```json
+{"tool": "get_variance_report", "arguments": {}}
+{"tool": "get_variance_report", "arguments": {"month": "2026-10"}}
+{"tool": "run_scenario", "arguments": {"horizon_months": 12, "expense_change_percent": 8}}
+{"tool": "run_scenario", "arguments": {"category_changes": {"payroll": 50000}, "one_time_expense": 150000}}
+```
+
+A scenario that has no records to average is refused with an explanation, and a projection
+that would make the monthly expense negative is refused before it runs.
+
+## Risk Register
+
+`add_risk` stores a risk in `company_data/risk_register.json` and derives its severity from
+the stated likelihood and impact: each rating is scored 1 (`low`), 2 (`medium`) or 3
+(`high`), the score is the product, and the level is `critical` (7-9), `high` (5-6),
+`medium` (3-4) or `low` (1-2). The score and level are computed on read and never stored,
+so they cannot drift from the ratings.
+
+`update_risk` accepts only the editable fields (`title`, `description`, `category`, `owner`,
+`mitigation`, `likelihood`, `impact`, `status`) and refuses a change that would not alter
+anything. `status` moves through `open`, `mitigating` and `closed`; `list_risks` filters by
+it and by `category` (case-insensitive) and sorts by `score`, `created` or `title`, with
+counts per level. Deletions are recorded in the audit trail with the risk that was removed.
+
+```json
+{"tool": "add_risk", "arguments": {"title": "Single supplier failure", "likelihood": "medium", "impact": "high", "owner": "Operations", "mitigation": "Qualify a second supplier"}}
+{"tool": "list_risks", "arguments": {"status": "open", "sort": "score"}}
+{"tool": "update_risk", "arguments": {"risk_id": "<id>", "changes": {"status": "mitigating", "likelihood": "low"}}}
+{"tool": "delete_risk", "arguments": {"risk_id": "<id>"}}
+```
+
 ## Data Layout
 
 The repository ships **no real company data**: the `company_data/` folder arrives empty and is
@@ -380,6 +478,8 @@ so that data cannot be lost. Back up the core files before starting another comp
 | `company_data/financials.json` | Budget, income/expense categories, transactions, cash flow summary |
 | `company_data/employees.csv` | Founder and employee records (`EMP-0001`, `EMP-0002`, ...) |
 | `company_data/company_notes.json` | Company notes (created on the first `update_company_notes` call) |
+| `company_data/audit_log.json` | Append-only change journal (created on the first write) |
+| `company_data/risk_register.json` | Scored risks with owners and mitigations (created on the first `add_risk`) |
 | `company_data/*.pdf`, `*.docx` | Your own documents (read-only) |
 
 You can drop your own TXT, MD, JSON, CSV, XLSX, PDF or DOCX documents into `company_data/`;
@@ -509,6 +609,8 @@ through the operating system.
 - Every read and write stays inside the data directory.
 - Files are updated atomically with a temporary file in the same directory plus `os.replace`.
 - Financial and employee changes run under a single wizard lock.
+- Changes are journaled before the data write; a failed write rolls the journal entry back,
+  so the log only describes changes that are on disk.
 - JSON structure, numeric fields, dates and table columns are validated.
 - Formula injection is neutralized in CSV and XLSX cells with a prefix character.
 - The installer merges MCP configurations instead of overwriting them.
@@ -593,6 +695,7 @@ the server and validates the tool list with a `tools/list` call. Use
 - [x] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
 - [x] Character budget for `read_company_file` output and PDF page ranges
+- [x] Append-only audit journal, read-only variance/scenario reports, and a risk register
 - [ ] Excel/PPTX reading support
 - [ ] Support for multiple company data directories
 - [ ] Backup/archive tool

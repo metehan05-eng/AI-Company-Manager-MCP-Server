@@ -191,6 +191,147 @@ def update_company_notes(
     return company_wizard.update_company_notes(note_title, content)
 
 
+@mcp.tool()
+@readable_errors
+def list_audit_entries(
+    action: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=100,
+            description="Only entries with this action, for example 'financial_record_added'.",
+        ),
+    ] = None,
+    limit: Annotated[int, Field(ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Read the append-only change journal: who changed what, newest first.
+
+    Every mutating tool records one entry here before its data is written, and a failed
+    write removes the entry again. Page with limit/offset; entries carry a gapless `seq`
+    number, so a missing sequence means an entry was deleted.
+    """
+    return company_wizard.list_audit_entries(action=action, limit=limit, offset=offset)
+
+
+@mcp.tool()
+@readable_errors
+def get_variance_report(
+    month: Annotated[
+        str | None,
+        Field(
+            max_length=7,
+            description="Narrow the monthly table to one month, formatted as YYYY-MM.",
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    """Compare spending against the budget and each month against the previous month.
+
+    Reports budget usage, monthly income/expense/net totals and how much each month
+    moved against the one before it. Read-only; nothing is written.
+    """
+    return company_wizard.get_variance_report(month=month)
+
+
+@mcp.tool()
+@readable_errors
+def run_scenario(
+    horizon_months: Annotated[int, Field(ge=1, le=120)] = 12,
+    income_change_percent: Annotated[float, Field(ge=-100, le=10_000)] = 0.0,
+    expense_change_percent: Annotated[float, Field(ge=-100, le=10_000)] = 0.0,
+    category_changes: Annotated[
+        dict[str, float] | None,
+        Field(
+            description=(
+                "Extra monthly amount per expense category, for example "
+                '{"payroll": 50000} to add 50,000 to payroll every month.'
+            )
+        ),
+    ] = None,
+    one_time_expense: Annotated[
+        NonNegativeAmount, Field(description="Charged once, in month 1.")
+    ] = 0.0,
+) -> dict[str, Any]:
+    """Project the balance forward under stated assumptions. A simulation only: nothing is saved.
+
+    The baseline is the historical monthly average. Output includes every projected month,
+    the closing balance and `runway_months` - the month the balance first turns negative,
+    or null when it never does inside the horizon.
+    """
+    return company_wizard.run_scenario(
+        horizon_months=horizon_months,
+        income_change_percent=income_change_percent,
+        expense_change_percent=expense_change_percent,
+        category_changes=category_changes,
+        one_time_expense=one_time_expense,
+    )
+
+
+@mcp.tool()
+@readable_errors
+def list_risks(
+    status: Annotated[
+        str | None,
+        Field(description="Only risks in this state: 'open', 'mitigating' or 'closed'."),
+    ] = None,
+    category: Annotated[str | None, Field(max_length=100)] = None,
+    sort: Annotated[
+        str,
+        Field(description="Order by 'score' (default, highest first), 'created' or 'title'."),
+    ] = "score",
+) -> dict[str, Any]:
+    """List registered risks with their severity score and level. Read-only."""
+    return company_wizard.list_risks(status=status, category=category, sort=sort)
+
+
+@mcp.tool()
+@readable_errors
+def add_risk(
+    title: Annotated[str, Field(min_length=1, max_length=200)],
+    likelihood: Annotated[str, Field(description="How likely the risk is: low, medium or high.")],
+    impact: Annotated[str, Field(description="How damaging it would be: low, medium or high.")],
+    description: Annotated[str, Field(max_length=4_000)] = "",
+    category: Annotated[str, Field(min_length=1, max_length=100)] = "general",
+    owner: Annotated[str, Field(max_length=200)] = "",
+    mitigation: Annotated[str, Field(max_length=4_000)] = "",
+) -> dict[str, Any]:
+    """Register a risk. Likelihood times impact gives a 1-9 score and a severity level."""
+    return company_wizard.add_risk(
+        title,
+        likelihood,
+        impact,
+        description=description,
+        category=category,
+        owner=owner,
+        mitigation=mitigation,
+    )
+
+
+@mcp.tool()
+@readable_errors
+def update_risk(
+    risk_id: Annotated[str, Field(min_length=1, max_length=100)],
+    changes: Annotated[
+        dict[str, str],
+        Field(
+            description=(
+                "Fields to change: title, description, category, owner, mitigation, "
+                "likelihood, impact or status."
+            )
+        ),
+    ],
+) -> dict[str, Any]:
+    """Change parts of an existing risk. Omitted fields keep their current value."""
+    return company_wizard.update_risk(risk_id, changes)
+
+
+@mcp.tool()
+@readable_errors
+def delete_risk(risk_id: Annotated[str, Field(min_length=1, max_length=100)]) -> dict[str, Any]:
+    """Remove a risk from the register. The deleted risk stays in the audit journal."""
+    return company_wizard.delete_risk(risk_id)
+
+
 def main() -> None:
     mcp.run()
 
