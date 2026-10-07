@@ -35,6 +35,43 @@ def _read_positive_integer(name: str, default: int, minimum: int) -> int:
     return value
 
 
+def _parse_page_selection(spec: str) -> list[tuple[int, int | None]]:
+    """Parse "1-3,7,9-" into inclusive ranges; a None end means "to the last page"."""
+    selection: list[tuple[int, int | None]] = []
+    for chunk in spec.split(","):
+        part = chunk.strip()
+        if not part:
+            raise CompanyFileError(f"'{spec}' is not a valid page selection; try '1-5' or '3'")
+        if "-" in part:
+            raw_start, _, raw_end = part.partition("-")
+            start_text, end_text = raw_start.strip(), raw_end.strip()
+            try:
+                start = int(start_text) if start_text else 1
+                end = int(end_text) if end_text else None
+            except ValueError as exc:
+                raise CompanyFileError(
+                    f"'{part}' is not a valid page range; try '1-5' or '3'"
+                ) from exc
+            if start < 1 or (end is not None and end < 1):
+                raise CompanyFileError(f"'{part}' is not a valid page range; pages start at 1")
+            if end is not None and end < start:
+                raise CompanyFileError(
+                    f"'{part}' is not a valid page range; the end must not precede the start"
+                )
+            selection.append((start, end))
+            continue
+        try:
+            page = int(part)
+        except ValueError as exc:
+            raise CompanyFileError(
+                f"'{spec}' is not a valid page selection; try '1-5' or '3'"
+            ) from exc
+        if page < 1:
+            raise CompanyFileError(f"'{part}' is not a valid page range; pages start at 1")
+        selection.append((page, page))
+    return selection
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
@@ -100,7 +137,7 @@ def _safe_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return safe_frame
 
 
-def _read_pdf(path: Path) -> str:
+def _read_pdf(path: Path, selection: list[tuple[int, int | None]] | None = None) -> tuple[str, int]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -110,6 +147,7 @@ def _read_pdf(path: Path) -> str:
 
     sections: list[str] = []
     has_text = False
+    page_count = 0
     try:
         with path.open("rb") as file_handle:
             reader = PdfReader(file_handle)
@@ -117,8 +155,11 @@ def _read_pdf(path: Path) -> str:
                 raise CompanyFileError(
                     "PDF is password-protected and cannot be read without a password"
                 )
-            for page_number, page in enumerate(reader.pages, start=1):
-                page_text = (page.extract_text() or "").strip()
+            pages = list(reader.pages)
+            page_count = len(pages)
+            wanted = _resolve_page_selection(selection, page_count)
+            for page_number in wanted:
+                page_text = (pages[page_number - 1].extract_text() or "").strip()
                 if page_text:
                     has_text = True
                     sections.append(f"--- Sayfa {page_number} ---\n{page_text}")
@@ -136,7 +177,31 @@ def _read_pdf(path: Path) -> str:
             "[UYARI: PDF metin içeriği bulunamadı. Belge taranmış görsel olabilir; "
             "metin almak için OCR uygulanmalıdır.]"
         )
-    return "\n\n".join(sections)
+    return "\n\n".join(sections), page_count
+
+
+def _resolve_page_selection(
+    selection: list[tuple[int, int | None]] | None, page_count: int
+) -> list[int]:
+    """Expand a parsed selection into page numbers, rejecting pages that do not exist."""
+    if selection is None:
+        return list(range(1, page_count + 1))
+
+    wanted: list[int] = []
+    for start, end in selection:
+        last = page_count if end is None else end
+        if start > page_count:
+            raise CompanyFileError(
+                f"page {start} does not exist; the document has {page_count} page(s)"
+            )
+        for page_number in range(start, min(last, page_count) + 1):
+            if page_number not in wanted:
+                wanted.append(page_number)
+    if not wanted:
+        raise CompanyFileError(
+            f"the page selection matches none of the {page_count} page(s) in the document"
+        )
+    return wanted
 
 
 def _read_docx(path: Path) -> str:
@@ -189,6 +254,7 @@ class FileHandler:
         else:
             self.max_file_size_mb = max_file_size_mb
         self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
+        self.max_read_chars = _read_positive_integer("COMPANY_READ_MAX_CHARS", 100_000, 1_000)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     def resolve_path(self, filename: str) -> tuple[Path, Path]:
@@ -284,28 +350,100 @@ class FileHandler:
             raise CompanyFileError(f"file exceeds the {limit} MB size limit")
 
     def read_file(self, filename: str) -> str:
-        _, path = self.resolve_path(filename)
+        """Read a file in full. Used for internal parsing, so nothing is ever trimmed."""
+        return self.read_report(filename, max_chars=0)["content"]
+
+    def read_report(
+        self,
+        filename: str,
+        start_char: int = 0,
+        max_chars: int | None = None,
+        pages: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a file for a caller that has to fit a context budget.
+
+        `max_chars` of 0 means "no limit". Trimming is always announced in `content`
+        and reflected in `truncated`, so a caller can never mistake a trimmed file for
+        the whole file.
+        """
+        relative_path, path = self.resolve_path(filename)
         self._ensure_readable_file(path)
         extension = path.suffix.lower()
 
+        if start_char < 0:
+            raise CompanyFileError("start_char must not be negative")
+        budget = self.max_read_chars if max_chars is None else max_chars
+        if budget < 0:
+            raise CompanyFileError("max_chars must not be negative")
+
+        selection: list[tuple[int, int | None]] | None = None
+        if pages is not None:
+            if extension != ".pdf":
+                raise CompanyFileError(
+                    f"pages only applies to PDF files; {relative_path.name} is {extension}"
+                )
+            selection = _parse_page_selection(pages)
+
+        content, page_count = self._extract_content(path, extension, selection)
+        total_chars = len(content)
+        offset = min(start_char, total_chars)
+        window = content[offset:]
+        truncated = bool(budget) and len(window) > budget
+        if truncated:
+            window = window[:budget]
+            window += self._trim_notice(relative_path.name, offset, window, total_chars)
+        consumed = offset + (budget if truncated else len(window))
+        next_start = min(consumed, total_chars)
+
+        return {
+            "filename": relative_path.as_posix(),
+            "format": extension.lstrip("."),
+            "size_bytes": path.stat().st_size,
+            "content": window,
+            "total_chars": total_chars,
+            "start_char": offset,
+            "next_start_char": next_start,
+            "truncated": truncated,
+            "pages": pages,
+            "total_pages": page_count,
+        }
+
+    @staticmethod
+    def _trim_notice(filename: str, offset: int, window: str, total_chars: int) -> str:
+        return (
+            f"\n\n[... {filename} kisaltildi: {total_chars} karakterin "
+            f"{offset + 1}-{offset + len(window)} arasi gosterildi. Devamini okumak icin "
+            f"start_char={offset + len(window)} ile tekrar cagirin.]"
+        )
+
+    def _extract_content(
+        self,
+        path: Path,
+        extension: str,
+        selection: list[tuple[int, int | None]] | None,
+    ) -> tuple[str, int | None]:
         if extension in TEXT_EXTENSIONS:
-            return path.read_text(encoding="utf-8-sig")
+            return path.read_text(encoding="utf-8-sig"), None
         if extension == ".json":
             with path.open("r", encoding="utf-8-sig") as file_handle:
                 data = json.load(
                     file_handle,
                     parse_constant=_reject_json_constant,
                 )
-            return json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-                default=_json_default,
+            return (
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                    default=_json_default,
+                ),
+                None,
             )
         if extension == ".csv":
             frame = _read_csv_frame(path.read_text(encoding="utf-8-sig"))
-            return frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
+            text = frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
+            return text, None
         if extension == ".xlsx":
             sections: list[str] = []
             with pd.ExcelFile(path, engine="openpyxl") as workbook:
@@ -318,11 +456,11 @@ class FileHandler:
                     )
                     csv_text = frame.to_csv(index=False, lineterminator="\n").rstrip("\n")
                     sections.append(f"## {sheet_name}\n{csv_text}")
-            return "\n\n".join(sections)
+            return "\n\n".join(sections), None
         if extension == ".pdf":
-            return _read_pdf(path)
+            return _read_pdf(path, selection)
         if extension == ".docx":
-            return _read_docx(path)
+            return _read_docx(path), None
 
         raise CompanyFileError(f"unsupported file extension: {extension}")
 

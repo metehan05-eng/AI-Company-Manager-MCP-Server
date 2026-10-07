@@ -122,14 +122,26 @@ class StdioClient:
         self._write(message)
 
     def call(self, tool: str, arguments: dict[str, Any]) -> str:
-        response = self.request("tools/call", {"name": tool, "arguments": arguments})
-        result = response.get("result") or {}
+        result = self.call_result(tool, arguments)
         blocks = result.get("content") or []
         text = " ".join(block.get("text", "") for block in blocks)
         if not text:
             msg = f"empty tool response for {tool}"
             raise AssertionError(msg)
         return text
+
+    def call_json(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Call a tool and return its structured payload instead of its rendered text."""
+        result = self.call_result(tool, arguments)
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict) and structured:
+            return structured
+        blocks = result.get("content") or []
+        return json.loads(" ".join(block.get("text", "") for block in blocks))
+
+    def call_result(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = self.request("tools/call", {"name": tool, "arguments": arguments})
+        return response.get("result") or {}
 
     def close(self) -> None:
         if self.process.stdin is not None:
@@ -156,6 +168,14 @@ class StdioClient:
 def client(data_dir: Path) -> Iterator[StdioClient]:
     with StdioClient(data_dir) as connected:
         yield connected
+
+
+def any_of(schema: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Return the matching member of a Pydantic anyOf (nullable) property schema."""
+    for member in schema.get("anyOf", []):
+        if member.get("type") == kind:
+            return member
+    raise AssertionError(f"{kind} option missing from {schema}")
 
 
 class TestToolRegistration:
@@ -623,3 +643,139 @@ class TestLiveProtocol:
     def test_path_traversal_rejected(self, client: StdioClient) -> None:
         text = client.call("read_company_file", {"filename": "../../etc/passwd"})
         assert "traversal" in text.lower() or "escapes" in text.lower()
+
+
+class TestReadCompanyFileBudget:
+    """The MCP surface must cap output and stay pageable end to end."""
+
+    NOTES = "not satiri\n" * 9_000
+
+    @pytest.fixture
+    def prepared(self, client: StdioClient) -> StdioClient:
+        client.call(
+            "create_new_company",
+            {
+                "company_name": "Acme",
+                "sector": "Yazilim",
+                "initial_budget": 50_000,
+                "vision": "v",
+                "mission": "m",
+            },
+        )
+        client.call(
+            "update_company_notes",
+            {"note_title": "notlar", "content": self.NOTES},
+        )
+        return client
+
+    def test_metadata_is_exposed(self, prepared: StdioClient) -> None:
+        report = prepared.call_json("read_company_file", {"filename": "employees.csv"})
+        assert report["filename"] == "employees.csv"
+        assert report["format"] == "csv"
+        assert report["size_bytes"] > 0
+        assert report["truncated"] is False
+        assert report["start_char"] == 0
+        assert report["next_start_char"] == report["total_chars"]
+        assert report["total_pages"] is None
+
+    def test_default_budget_keeps_a_large_note_small(self, prepared: StdioClient) -> None:
+        report = prepared.call_json("read_company_file", {"filename": "company_notes.json"})
+        assert report["total_chars"] > 100_000
+        assert report["truncated"] is True
+        assert "kisaltildi" in report["content"]
+
+    def test_paging_reassembles_the_file(self, prepared: StdioClient) -> None:
+        whole = prepared.call_json(
+            "read_company_file", {"filename": "company_notes.json", "max_chars": 0}
+        )
+        collected = ""
+        offset = 0
+        for _ in range(50):
+            part = prepared.call_json(
+                "read_company_file",
+                {"filename": "company_notes.json", "start_char": offset, "max_chars": 10_000},
+            )
+            collected += part["content"]
+            offset = part["next_start_char"]
+            if not part["truncated"]:
+                break
+        assert offset == whole["total_chars"]
+        assert "not satiri" in collected
+
+    def test_max_chars_zero_returns_everything(self, prepared: StdioClient) -> None:
+        report = prepared.call_json(
+            "read_company_file", {"filename": "company_notes.json", "max_chars": 0}
+        )
+        assert report["truncated"] is False
+        assert report["total_chars"] > 100_000
+        assert "not satiri" in report["content"]
+        assert report["content"].rstrip().endswith("}")
+
+    def test_pages_on_a_text_file_is_refused(self, prepared: StdioClient) -> None:
+        error = prepared.call(
+            "read_company_file", {"filename": "company_notes.json", "pages": "1-2"}
+        )
+        assert "pages only applies to PDF files" in error
+
+    def test_negative_max_chars_is_rejected(self, prepared: StdioClient) -> None:
+        error = prepared.call(
+            "read_company_file", {"filename": "company_notes.json", "max_chars": -1}
+        )
+        assert "max_chars" in error
+
+    def test_schema_exposes_the_new_parameters(self) -> None:
+        schema = mcp._tool_manager.get_tool("read_company_file").parameters
+        properties = schema["properties"]
+        assert properties["start_char"] == {
+            "default": 0,
+            "minimum": 0,
+            "title": "Start Char",
+            "type": "integer",
+        }
+        assert any_of(properties["max_chars"], "integer") == {"minimum": 0, "type": "integer"}
+        assert any_of(properties["pages"], "string") == {
+            "maxLength": 100,
+            "minLength": 1,
+            "type": "string",
+        }
+        assert "start_char" not in schema.get("required", [])
+        assert "pages" not in schema.get("required", [])
+
+    def test_internal_json_reads_are_not_capped(self, prepared: StdioClient) -> None:
+        report = prepared.call_json("read_company_file", {"filename": "company_profile.json"})
+        assert report["truncated"] is False
+        assert "company_name" in report["content"]
+        summary = prepared.call_json("get_financial_report", {})
+        assert summary["company_name"] == "Acme"
+
+
+class TestInternalReadsAreUncapped:
+    """`CompanyWizard` parses its own models through read_file; a small report budget
+    must never trim what the server reads from disk."""
+
+    def test_wizard_still_loads_models_under_a_tiny_budget(
+        self, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COMPANY_READ_MAX_CHARS", "1000")
+        with StdioClient(data_dir) as prepared:
+            prepared.call(
+                "create_new_company",
+                {
+                    "company_name": "Acme",
+                    "sector": "Yazilim",
+                    "initial_budget": 50_000,
+                    "vision": "v",
+                    "mission": "m",
+                },
+            )
+            prepared.call(
+                "update_company_notes",
+                {"note_title": "notlar", "content": "x" * 5_000},
+            )
+            notes = prepared.call_json("read_company_file", {"filename": "company_notes.json"})
+            assert notes["total_chars"] > 5_000
+            assert notes["truncated"] is True
+            summary = prepared.call_json("get_financial_report", {})
+            assert summary["company_name"] == "Acme"
+            listing = prepared.call_json("inspect_company_data", {})
+            assert any("company_profile.json" in str(item) for item in listing.get("files", []))

@@ -74,16 +74,24 @@ def get_financial_report(
 
 @mcp.tool()
 @readable_errors
-def read_company_file(filename: str) -> dict[str, Any]:
-    """Read a supported company TXT, MD, JSON, CSV, XLSX, PDF, or DOCX file as text."""
-    relative_path, path = file_handler.resolve_path(filename)
-    content = file_handler.read_file(filename)
-    return {
-        "filename": relative_path.as_posix(),
-        "format": relative_path.suffix.lower().lstrip("."),
-        "size_bytes": path.stat().st_size,
-        "content": content,
-    }
+def read_company_file(
+    filename: str,
+    start_char: Annotated[int, Field(ge=0)] = 0,
+    max_chars: Annotated[int | None, Field(ge=0)] = None,
+    pages: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
+) -> dict[str, Any]:
+    """Read a supported company TXT, MD, JSON, CSV, XLSX, PDF, or DOCX file as text.
+
+    Output is capped so a large file cannot flood the context. Read `total_chars` and
+    `next_start_char` from the response and pass `next_start_char` back as `start_char`
+    to continue. `pages` narrows a PDF to a range such as "1-5" or "2,7-9".
+    """
+    return file_handler.read_report(
+        filename,
+        start_char=start_char,
+        max_chars=max_chars,
+        pages=pages,
+    )
 
 
 @mcp.tool()

@@ -207,7 +207,8 @@ Content written on Linux and macOS:
       "args": ["${workspaceFolder}/run_mcp.sh"],
       "env": {
         "COMPANY_DATA_DIR": "${workspaceFolder}/company_data",
-        "COMPANY_MAX_FILE_MB": "10"
+        "COMPANY_MAX_FILE_MB": "10",
+        "COMPANY_READ_MAX_CHARS": "100000"
       }
     }
   }
@@ -237,7 +238,8 @@ macOS/Linux:
       "args": ["/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/src/server.py"],
       "env": {
         "COMPANY_DATA_DIR": "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/company_data",
-        "COMPANY_MAX_FILE_MB": "10"
+        "COMPANY_MAX_FILE_MB": "10",
+        "COMPANY_READ_MAX_CHARS": "100000"
       }
     }
   }
@@ -264,7 +266,8 @@ Create an `opencode.json` in the project root:
       "enabled": true,
       "environment": {
         "COMPANY_DATA_DIR": "/ABSOLUT/PATH/AI-Company-Manager-MCP-Server/company_data",
-        "COMPANY_MAX_FILE_MB": "10"
+        "COMPANY_MAX_FILE_MB": "10",
+        "COMPANY_READ_MAX_CHARS": "100000"
       }
     }
   }
@@ -280,7 +283,7 @@ OpenCode only reads its settings at startup, so restart it after editing.
 | `list_company_files` | Lists every file in the data directory with type, size and modification time. | — |
 | `get_company_overview` | Returns a summary of profile, budget, income, expenses, net cash flow and current balance. | — |
 | `get_financial_report` | Reports the same totals plus income and expense splits by category and the cash flow periods. Read-only. | — (`period` is optional) |
-| `read_company_file` | Converts a supported file into text the AI can analyze. | `filename` |
+| `read_company_file` | Converts a supported file into text the AI can analyze, capped to a character budget and pageable. | `filename` (`start_char`, `max_chars`, `pages` are optional) |
 | `create_new_company` | Creates the profile, financial file and founder row. | `company_name`, `sector`, `initial_budget` |
 | `add_financial_record` | Appends an `income` or `expense` transaction to `financials.json`. | `type`, `category`, `amount`, `description` |
 | `add_employee` | Appends a validated employee record to `employees.csv`. | `name`, `role`, `department`, `salary` |
@@ -292,6 +295,36 @@ OpenCode only reads its settings at startup, so restart it after editing.
 
 All arguments are validated with Pydantic: empty text, a negative budget, a zero-amount financial
 record or a description longer than 2,000 characters is rejected.
+
+### Reading Large Files
+
+`read_company_file` never returns more than `max_chars` characters at a time (default
+`100_000`, configured by `COMPANY_READ_MAX_CHARS`), so a spreadsheet or PDF cannot flood
+the context. Every response carries the fields you need to continue:
+
+| Field | Meaning |
+|---|---|
+| `total_chars` | Full length of the extracted text, before any trimming. |
+| `start_char` | Where this response starts in that text. |
+| `next_start_char` | Pass this back as `start_char` to read the next slice. |
+| `truncated` | `true` when the response was cut short; the payload then ends with a visible notice. |
+| `total_pages` | PDF page count, or `null` for other formats. |
+| `pages` | The page selection you asked for, echoed back. |
+
+```text
+read_company_file(filename="budget.xlsx")                 # first 100,000 characters
+read_company_file(filename="budget.xlsx", start_char=100000)
+read_company_file(filename="budget.xlsx", max_chars=0)     # opt out and read everything
+read_company_file(filename="report.pdf", pages="1-5")      # a single range
+read_company_file(filename="report.pdf", pages="2,7-9,12-")# several ranges, open ended
+```
+
+`pages` accepts a page (`"3"`), a closed range (`"1-5"`), a comma-separated list of either
+(`"2,7-9"`) and an open-ended range that runs to the last page (`"12-"`). It applies to PDFs
+only: passing `pages` for any other format is an error rather than being silently ignored,
+as is a range beyond the end of the document. Pages are selected while the PDF is parsed, so
+asking for `"2,7-9"` never loads pages 1 and 10 into the output. `max_chars=0` is the only
+way to ask for the whole file; internal reads such as the JSON models are never trimmed.
 
 ## Example Client Calls
 
@@ -465,6 +498,7 @@ A file that is already canonical is left alone, so the call is safe to repeat.
 |---|---|---|
 | `COMPANY_DATA_DIR` | `company_data` inside the project | Absolute path, or relative to the project root. |
 | `COMPANY_MAX_FILE_MB` | `10` | File size limit for reads and writes (minimum 1). |
+| `COMPANY_READ_MAX_CHARS` | `100000` | Characters returned by `read_company_file` before the output is trimmed and paged (minimum 1000). |
 
 `.env.example` is a template only; provide environment variables through the client `env` field or
 through the operating system.
@@ -558,7 +592,7 @@ the server and validates the tool list with a `tools/list` call. Use
 - [x] Apply a confirmed `company_profile.json` / `financials.json` mapping with a backup
 - [x] Period breakdown table for budget and cash flow
 - [ ] Update and delete operations for financial records and employees
-- [ ] Character budget for `read_company_file` output and PDF page ranges
+- [x] Character budget for `read_company_file` output and PDF page ranges
 - [ ] Excel/PPTX reading support
 - [ ] Support for multiple company data directories
 - [ ] Backup/archive tool

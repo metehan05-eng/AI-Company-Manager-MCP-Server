@@ -210,3 +210,174 @@ class TestListFiles:
 
     def test_empty_directory(self, handler: FileHandler) -> None:
         assert handler.list_files() == []
+
+
+class TestReadBudget:
+    """A large file must never be returned whole, and must stay readable page by page."""
+
+    @pytest.fixture
+    def long_notes(self, handler: FileHandler) -> str:
+        handler.write_file("notlar.md", "".join(f"satir {index}\n" for index in range(1, 201)))
+        return handler.read_file("notlar.md")
+
+    def test_read_file_is_never_trimmed(self, handler: FileHandler, long_notes: str) -> None:
+        assert handler.read_report("notlar.md", max_chars=50)["total_chars"] == len(long_notes)
+        assert handler.read_file("notlar.md") == long_notes
+
+    def test_max_chars_zero_means_no_limit(self, handler: FileHandler, long_notes: str) -> None:
+        report = handler.read_report("notlar.md", max_chars=0)
+        assert report["content"] == long_notes
+        assert report["truncated"] is False
+        assert report["next_start_char"] == len(long_notes)
+
+    @pytest.mark.usefixtures("long_notes")
+    def test_oversized_output_is_capped_and_announced(self, handler: FileHandler) -> None:
+        report = handler.read_report("notlar.md", max_chars=100)
+        assert report["truncated"] is True
+        assert report["total_chars"] > 100
+        assert report["content"].startswith("satir 1\n")
+        assert "kisaltildi" in report["content"]
+        assert report["next_start_char"] == 100
+
+    def test_output_within_budget_is_untouched(self, handler: FileHandler) -> None:
+        handler.write_file("kisa.txt", "kisa bir not")
+        report = handler.read_report("kisa.txt", max_chars=100_000)
+        assert report["truncated"] is False
+        assert "kisaltildi" not in report["content"]
+
+    @pytest.mark.usefixtures("long_notes")
+    def test_paging_reads_the_whole_file_without_gaps(self, handler: FileHandler) -> None:
+        whole = handler.read_file("notlar.md")
+        collected = ""
+        offset = 0
+        for _ in range(len(whole)):
+            report = handler.read_report("notlar.md", start_char=offset, max_chars=120)
+            collected += report["content"]
+            offset = report["next_start_char"]
+            if not report["truncated"]:
+                break
+        assert offset == len(whole)
+        assert "satir 200" in collected
+        assert not collected.rstrip().endswith("]")
+
+    @pytest.mark.usefixtures("long_notes")
+    def test_start_char_past_the_end_returns_nothing(self, handler: FileHandler) -> None:
+        report = handler.read_report("notlar.md", start_char=999_999)
+        assert report["content"] == ""
+        assert report["start_char"] == report["total_chars"]
+        assert report["truncated"] is False
+
+    @pytest.mark.usefixtures("long_notes")
+    def test_negative_arguments_are_rejected(self, handler: FileHandler) -> None:
+        with pytest.raises(CompanyFileError):
+            handler.read_report("notlar.md", start_char=-1)
+        with pytest.raises(CompanyFileError):
+            handler.read_report("notlar.md", max_chars=-5)
+
+    @pytest.mark.usefixtures("long_notes")
+    def test_configured_default_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        monkeypatch.setenv("COMPANY_READ_MAX_CHARS", "1000")
+        small = FileHandler(data_dir=data_dir)
+        assert small.max_read_chars == 1000
+        assert small.read_report("notlar.md")["truncated"] is True
+
+    def test_default_budget_is_generous(self, handler: FileHandler) -> None:
+        assert handler.max_read_chars == 100_000
+
+    def test_non_integer_configured_budget_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        monkeypatch.setenv("COMPANY_READ_MAX_CHARS", "cok-fazla")
+        with pytest.raises(CompanyFileError) as excinfo:
+            FileHandler(data_dir=data_dir)
+        assert "must be an integer" in str(excinfo.value)
+
+    def test_too_small_configured_budget_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        monkeypatch.setenv("COMPANY_READ_MAX_CHARS", "10")
+        with pytest.raises(CompanyFileError):
+            FileHandler(data_dir=data_dir)
+
+
+class TestPdfPageSelection:
+    @pytest.fixture
+    def report(self, handler: FileHandler, data_dir: Path) -> FileHandler:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "rapor.pdf").write_bytes(make_pdf_bytes("Sirket Raporu", pages=6))
+        return handler
+
+    def test_page_range_limits_the_output(self, report: FileHandler) -> None:
+        content = report.read_report("rapor.pdf", pages="1-2", max_chars=0)["content"]
+        assert content.count("--- Sayfa ") == 2
+        assert "--- Sayfa 1 ---" in content
+        assert "sayfa 2" in content
+        assert "--- Sayfa 3 ---" not in content
+
+    def test_total_pages_is_reported(self, report: FileHandler) -> None:
+        assert report.read_report("rapor.pdf", max_chars=0)["total_pages"] == 6
+        assert report.read_report("rapor.pdf", pages="2", max_chars=0)["total_pages"] == 6
+
+    def test_open_ended_range_runs_to_the_last_page(self, report: FileHandler) -> None:
+        content = report.read_report("rapor.pdf", pages="5-", max_chars=0)["content"]
+        assert content.count("--- Sayfa ") == 2
+        assert "--- Sayfa 6 ---" in content
+
+    def test_single_page(self, report: FileHandler) -> None:
+        content = report.read_report("rapor.pdf", pages="4", max_chars=0)["content"]
+        assert content.count("--- Sayfa ") == 1
+        assert "sayfa 4" in content
+
+    def test_multiple_ranges_and_duplicates(self, report: FileHandler) -> None:
+        content = report.read_report("rapor.pdf", pages="1,3,4-5,3", max_chars=0)["content"]
+        assert content.count("--- Sayfa ") == 4
+        assert "--- Sayfa 5 ---" in content
+        assert "--- Sayfa 2 ---" not in content
+
+    def test_whitespace_in_selection_is_tolerated(self, report: FileHandler) -> None:
+        content = report.read_report("rapor.pdf", pages=" 1 - 2 , 4 ", max_chars=0)["content"]
+        assert content.count("--- Sayfa ") == 3
+
+    def test_pages_are_echoed_back(self, report: FileHandler) -> None:
+        assert report.read_report("rapor.pdf", pages="1-2", max_chars=0)["pages"] == "1-2"
+        assert report.read_report("rapor.pdf", max_chars=0)["pages"] is None
+
+    @pytest.mark.parametrize(
+        "selection",
+        ["0", "3-0", "5-2", "abc", "1-a", "13", "9-", "1-0", ""],
+    )
+    def test_invalid_selection_is_rejected(self, report: FileHandler, selection: str) -> None:
+        with pytest.raises(CompanyFileError):
+            report.read_report("rapor.pdf", pages=selection, max_chars=0)
+
+    def test_out_of_range_message_states_the_page_count(self, report: FileHandler) -> None:
+        with pytest.raises(CompanyFileError) as excinfo:
+            report.read_report("rapor.pdf", pages="9", max_chars=0)
+        assert "page 9 does not exist" in str(excinfo.value)
+        assert "6 page(s)" in str(excinfo.value)
+
+    def test_pages_on_a_non_pdf_is_rejected(self, report: FileHandler) -> None:
+        report.write_file("notlar.md", "not")
+        with pytest.raises(CompanyFileError) as excinfo:
+            report.read_report("notlar.md", pages="1-2")
+        assert "pages only applies to PDF files" in str(excinfo.value)
+
+    def test_trimmed_text_is_taken_before_the_pdf_is_cut(self, report: FileHandler) -> None:
+        whole = report.read_report("rapor.pdf", max_chars=0)["total_chars"]
+        part = report.read_report("rapor.pdf", pages="1-2", max_chars=0)["total_chars"]
+        assert part < whole
+
+    def test_selection_survives_the_budget(self, report: FileHandler) -> None:
+        result = report.read_report("rapor.pdf", pages="1", max_chars=10)
+        assert result["truncated"] is True
+        assert result["total_pages"] == 6
+        assert result["start_char"] == 0
+
+    def test_empty_selection_is_refused(self) -> None:
+        from src.file_handler import _resolve_page_selection
+
+        with pytest.raises(CompanyFileError) as excinfo:
+            _resolve_page_selection([], 3)
+        assert "matches none of the 3 page(s)" in str(excinfo.value)

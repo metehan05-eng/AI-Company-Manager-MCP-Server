@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `read_company_file` gained a character budget and PDF page selection. Output is
+  capped at `max_chars` characters (default `100_000`, configured by
+  `COMPANY_READ_MAX_CHARS`), and the response reports `total_chars`, `start_char`,
+  `next_start_char` and `truncated` so a trimmed file can be read to the end in slices;
+  a trimmed payload ends with a visible notice. `pages` selects PDF pages as `"3"`,
+  `"1-5"`, `"2,7-9"` or `"12-"` while the document is parsed, and rejects ranges past the
+  last page. Internal reads, including the JSON models, are unaffected.
 - `get_financial_report` tool: a read-only breakdown of `financials.json`. Reports the
   totals, remaining budget and budget usage, splits income and expenses by category
   (largest first, with record count and share), and lists the `cash_flow_template`
@@ -76,7 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Planned
 
 - `update_employee`, `delete_financial_record`, and `list_notes` tools
-- Character budget for `read_company_file` output and PDF page ranges
 - Excel and PPTX reading support
 - Support for multiple company data directories
 - Backup/archive tool
