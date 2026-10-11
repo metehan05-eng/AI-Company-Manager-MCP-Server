@@ -1567,6 +1567,25 @@ class TestAuditTrail:
         financials = json.loads((data_dir / "financials.json").read_text(encoding="utf-8"))
         assert financials["records"] == []
 
+    def test_failed_init_leaves_no_audit_file(
+        self, wizard: CompanyWizard, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original = wizard.file_handler.write_file
+
+        def failing(filename: str, content: object) -> dict[str, Any]:
+            if filename == "financials.json":
+                msg = "disk full"
+                raise OSError(msg)
+            return original(filename, content)
+
+        monkeypatch.setattr(wizard.file_handler, "write_file", failing)
+        with pytest.raises(OSError, match="disk full"):
+            wizard.init_company("Acme", "Yazilim", 10_000.0)
+        assert not (data_dir / "audit_log.json").exists()
+        assert not (data_dir / "company_profile.json").exists()
+        assert not (data_dir / "financials.json").exists()
+        assert not (data_dir / "employees.csv").exists()
+
     def test_unknown_action_filter_lists_what_exists(self, company: CompanyWizard) -> None:
         with pytest.raises(ValueError) as excinfo:
             company.list_audit_entries(action="made_up")
@@ -1656,6 +1675,26 @@ class TestVarianceReport:
         assert report["budget"]["spent"] == Decimal("10000.00")
         assert report["budget"]["used_percent"] == 100.0
         assert report["budget"]["over_budget"] is False
+
+    def test_percentages_round_half_up(self, company: CompanyWizard) -> None:
+        company.add_financial_record("expense", "equipment", 5625.0, "x")
+        report = company.get_variance_report()
+        assert report["budget"]["used_percent"] == 56.3
+
+    def test_month_over_month_net_percentage_rounds_half_up(
+        self, company: CompanyWizard, data_dir: Path
+    ) -> None:
+        company.add_financial_record("income", "services", 10000.0, "a")
+        company.add_financial_record("expense", "rent", 2000.0, "a")
+        company.add_financial_record("income", "services", 15000.0, "b")
+        company.add_financial_record("expense", "rent", 2500.0, "b")
+        spread_records_across(data_dir, ["2026-01", "2026-01", "2026-02", "2026-02"])
+        second = company.get_variance_report()["monthly"][1]
+        assert second["change_percent_vs_previous"] == {
+            "income": 50.0,
+            "expense": 25.0,
+            "net": 56.3,
+        }
 
     def test_month_filter_returns_only_that_month(
         self, company: CompanyWizard, data_dir: Path

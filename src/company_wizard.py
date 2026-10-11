@@ -166,6 +166,11 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+_PERCENT_QUANTIZE = Decimal("0.1")
+_MONEY_QUANTIZE = Decimal("0.01")
+_ROUNDING = "ROUND_HALF_UP"
+
+
 def _format_month(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
 
@@ -180,7 +185,9 @@ def _percent_change(current: Decimal, previous: Decimal) -> float | None:
     """Percentage moved from `previous` to `current`, or None when there is no base."""
     if previous == 0:
         return None
-    return float(((current - previous) / previous * 100).quantize(Decimal("0.1")))
+    return float(
+        ((current - previous) / previous * 100).quantize(_PERCENT_QUANTIZE, rounding=_ROUNDING)
+    )
 
 
 def _clean_required_text(value: str, field_name: str) -> str:
@@ -518,7 +525,7 @@ def _category_breakdown(
             "amount": amount,
             "record_count": counts[category],
             "share_percent": (
-                float((amount / grand_total * 100).quantize(Decimal("0.1")))
+                float((amount / grand_total * 100).quantize(_PERCENT_QUANTIZE, rounding=_ROUNDING))
                 if grand_total
                 else None
             ),
@@ -862,10 +869,14 @@ class CompanyWizard:
 
         Journaling before the data write keeps the log from claiming a change that never
         landed; a failed write removes the entry again, so the log only ever describes
-        changes that are on disk. The lock is reentrant, so this is safe to call from
-        methods that already hold it.
+        changes that are on disk. When the journal itself was created by this call and the
+        change then fails, the empty file is removed too, so a failed initialization leaves
+        nothing behind. The lock is reentrant, so this is safe to call from methods that
+        already hold it.
         """
         with self._lock:
+            audit_path = self.file_handler.data_dir / "audit_log.json"
+            audit_existed = audit_path.exists()
             log = self._load_audit()
             entry = AuditEntry(
                 seq=len(log.entries) + 1,
@@ -881,9 +892,12 @@ class CompanyWizard:
                 write()
             except Exception:
                 log.entries.pop()
-                log.updated_at = _utc_now()
                 with contextlib.suppress(Exception):
-                    self._write_model("audit_log.json", log)
+                    if log.entries or audit_existed:
+                        log.updated_at = _utc_now()
+                        self._write_model("audit_log.json", log)
+                    else:
+                        audit_path.unlink(missing_ok=True)
                 raise
 
     def _existing_template_can_be_replaced(self) -> bool:
@@ -1904,7 +1918,9 @@ class CompanyWizard:
                 "remaining_budget": remaining,
                 "budget_used_percent": (
                     float(
-                        (total_expenses / financials.initial_budget * 100).quantize(Decimal("0.1"))
+                        (total_expenses / financials.initial_budget * 100).quantize(
+                            _PERCENT_QUANTIZE, rounding=_ROUNDING
+                        )
                     )
                     if financials.initial_budget
                     else None
@@ -2037,7 +2053,9 @@ class CompanyWizard:
                 "over_budget": over_budget,
                 "used_percent": (
                     float(
-                        (total_expenses / financials.initial_budget * 100).quantize(Decimal("0.1"))
+                        (total_expenses / financials.initial_budget * 100).quantize(
+                            _PERCENT_QUANTIZE, rounding=_ROUNDING
+                        )
                     )
                     if financials.initial_budget
                     else None
@@ -2110,18 +2128,20 @@ class CompanyWizard:
         baseline_income = (
             sum((bucket["income"] for bucket in history.values()), Decimal("0.00"))
             / observed_months
-        ).quantize(Decimal("0.01"))
+        ).quantize(_MONEY_QUANTIZE, rounding=_ROUNDING)
         baseline_expense = (
             sum((bucket["expense"] for bucket in history.values()), Decimal("0.00"))
             / observed_months
-        ).quantize(Decimal("0.01"))
+        ).quantize(_MONEY_QUANTIZE, rounding=_ROUNDING)
 
         income_factor = 1 + Decimal(str(income_change_percent)) / 100
         expense_factor = 1 + Decimal(str(expense_change_percent)) / 100
-        monthly_income = (baseline_income * income_factor).quantize(Decimal("0.01"))
+        monthly_income = (baseline_income * income_factor).quantize(
+            _MONEY_QUANTIZE, rounding=_ROUNDING
+        )
         monthly_expense = (
             baseline_expense * expense_factor + sum(deltas.values(), Decimal("0.00"))
-        ).quantize(Decimal("0.01"))
+        ).quantize(_MONEY_QUANTIZE, rounding=_ROUNDING)
         if monthly_expense < 0:
             raise ValueError(
                 f"projected monthly expense would be negative ({monthly_expense}); "

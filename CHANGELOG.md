@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Percentages in the reports now round **half up**: a `56.25%` movement reads as `56.3%`
+  instead of the banker's `56.2%` that Python's default `ROUND_HALF_EVEN` produced. Applied
+  to `get_variance_report` (budget usage, month-over-month change) and the existing
+  `get_financial_report` (budget usage, category `share_percent`); scenario money averaging
+  uses the same rounding.
+- A failed initialization no longer leaves an empty `audit_log.json` behind: when the
+  journal file was created by the failed call, the rollback removes it along with the core
+  files, so nothing is left on disk for a company that was never initialized.
+- Documented that the audit `seq` assumes a single MCP process owns `COMPANY_DATA_DIR`: two
+  servers sharing one directory could interleave journal entries.
 - Cross-file problems in the migration plan are now answerable open items
   (`company_profile.json:currency`, `financials.json:company_name`) instead of plain text
   questions, so they can be confirmed with `apply_company_data_migration`.
