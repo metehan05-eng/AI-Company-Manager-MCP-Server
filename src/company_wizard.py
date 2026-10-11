@@ -4,7 +4,7 @@ import contextlib
 import json
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -826,6 +826,19 @@ class CompanyWizard:
         self.file_handler = file_handler or FileHandler()
         self._lock = threading.RLock()
 
+    @contextlib.contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Hold the in-process lock and the cross-process lock around a read-modify-write.
+
+        Every method that can change the data directory wraps its whole
+        read-modify-write in this context so two MCP processes sharing a
+        ``COMPANY_DATA_DIR`` cannot lose updates or interleave journal entries.
+        Both locks are reentrant, so nested use (a public method calling
+        ``_commit``) is a no-op.
+        """
+        with self._lock, self.file_handler.cross_process_lock():
+            yield
+
     def _write_model(self, filename: str, model: BaseModel) -> None:
         self.file_handler.write_file(
             filename,
@@ -874,7 +887,7 @@ class CompanyWizard:
         nothing behind. The lock is reentrant, so this is safe to call from methods that
         already hold it.
         """
-        with self._lock:
+        with self._transaction():
             audit_path = self.file_handler.data_dir / "audit_log.json"
             audit_existed = audit_path.exists()
             log = self._load_audit()
@@ -980,7 +993,7 @@ class CompanyWizard:
         )
 
         core_files = ("company_profile.json", "financials.json", "employees.csv")
-        with self._lock:
+        with self._transaction():
             if not self._existing_template_can_be_replaced():
                 raise FileExistsError(
                     "company data already exists; move or remove the existing core files before initializing a company"
@@ -1063,7 +1076,7 @@ class CompanyWizard:
             amount=_normalize_money(amount, "amount"),
             description=description,
         )
-        with self._lock:
+        with self._transaction():
             financials = self._read_model("financials.json", CompanyFinancials)
             if record.type == "income":
                 categories = financials.revenue_categories
@@ -1141,7 +1154,7 @@ class CompanyWizard:
         salary: float,
     ) -> dict[str, Any]:
         salary_value = _normalize_money(salary, "salary")
-        with self._lock:
+        with self._transaction():
             frame = self._read_employees()
             numeric_ids = (
                 frame["employee_id"]
@@ -1802,7 +1815,7 @@ class CompanyWizard:
     def update_company_notes(self, note_title: str, content: str) -> dict[str, Any]:
         title = _clean_required_text(note_title, "note_title")
         clean_content = _clean_required_text(content, "content")
-        with self._lock:
+        with self._transaction():
             try:
                 notes = self._read_model("company_notes.json", CompanyNotes)
             except FileNotFoundError:
@@ -2288,7 +2301,7 @@ class CompanyWizard:
             owner=owner,
             mitigation=mitigation,
         )
-        with self._lock:
+        with self._transaction():
             register = self._read_register()
             register.risks.append(risk)
             register.updated_at = _utc_now()
@@ -2311,7 +2324,7 @@ class CompanyWizard:
                 f"unknown field(s): {', '.join(str(key) for key in unknown)}. "
                 f"Editable fields: {', '.join(RISK_EDITABLE_FIELDS)}"
             )
-        with self._lock:
+        with self._transaction():
             register = self._read_register()
             risk = next((item for item in register.risks if item.id == risk_id), None)
             if risk is None:
@@ -2346,7 +2359,7 @@ class CompanyWizard:
         }
 
     def delete_risk(self, risk_id: str) -> dict[str, Any]:
-        with self._lock:
+        with self._transaction():
             register = self._read_register()
             risk = next((item for item in register.risks if item.id == risk_id), None)
             if risk is None:

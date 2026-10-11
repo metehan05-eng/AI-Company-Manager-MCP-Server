@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import tempfile
+import threading
+import time
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID
 
 import pandas as pd
@@ -234,6 +237,106 @@ def _read_docx(path: Path) -> str:
     return "\n\n".join(sections)
 
 
+class _LockEntry:
+    """Process-wide state shared by every lock object for one data directory."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.holds = 0
+        self.handle: Any = None
+
+
+class CrossProcessLock:
+    """Reentrant advisory file lock that serializes writers across processes.
+
+    The lock file lives in the system temporary directory (never inside the data
+    directory) and is named after a hash of the data directory's absolute path, so
+    every process and thread pointing at the same data directory contends for the
+    same lock. Within a single process the shared ``threading.RLock`` serializes
+    threads, and the OS lock (``flock`` on POSIX, ``msvcrt`` on Windows) serializes
+    processes. The lock is advisory and host-local: a data directory shared over a
+    network filesystem is not coordinated.
+    """
+
+    _entries: ClassVar[dict[str, _LockEntry]] = {}
+    _entries_guard = threading.Lock()
+
+    def __init__(self, data_dir: str | Path) -> None:
+        resolved = Path(data_dir).expanduser().resolve()
+        digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+        self.lock_path = Path(tempfile.gettempdir()) / f"ai-company-manager-{digest}.lock"
+        self._entry: _LockEntry | None = None
+
+    def __enter__(self) -> CrossProcessLock:
+        with CrossProcessLock._entries_guard:
+            entry = CrossProcessLock._entries.setdefault(str(self.lock_path), _LockEntry())
+        entry.lock.acquire()
+        try:
+            if entry.holds == 0:
+                handle = self.lock_path.open("a+", encoding="utf-8")
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write("0")
+                    handle.flush()
+                handle.seek(0)
+                entry.handle = handle
+                _acquire_os_lock(handle)
+            entry.holds += 1
+        except BaseException:
+            if entry.handle is not None:
+                entry.handle.close()
+                entry.handle = None
+            entry.lock.release()
+            raise
+        self._entry = entry
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        entry = self._entry
+        if entry is None:
+            return
+        self._entry = None
+        try:
+            entry.holds -= 1
+            if entry.holds == 0 and entry.handle is not None:
+                _release_os_lock(entry.handle)
+                entry.handle.close()
+                entry.handle = None
+        finally:
+            entry.lock.release()
+
+
+def _acquire_os_lock(handle: Any) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        import msvcrt
+
+        deadline = time.monotonic() + 60.0
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _release_os_lock(handle: Any) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class FileHandler:
     def __init__(
         self,
@@ -256,6 +359,10 @@ class FileHandler:
         self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
         self.max_read_chars = _read_positive_integer("COMPANY_READ_MAX_CHARS", 100_000, 1_000)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    def cross_process_lock(self) -> CrossProcessLock:
+        """Return a reentrant advisory lock guarding this handler's data directory."""
+        return CrossProcessLock(self.data_dir)
 
     def resolve_path(self, filename: str) -> tuple[Path, Path]:
         if not isinstance(filename, str) or not filename.strip():

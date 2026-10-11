@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -2004,3 +2005,46 @@ class TestRisks:
         assert reloaded["count"] == 1
         assert reloaded["risks"][0]["mitigation"] == "İkinci tedarikçi"
         assert reloaded["risks"][0]["level"] == "high"
+
+
+class TestConcurrentWrites:
+    def test_concurrent_risk_adds_keep_every_update(self, tmp_path: Path) -> None:
+        handler = FileHandler(data_dir=tmp_path / "company_data")
+        CompanyWizard(handler).init_company("Acme", "Yazilim", 1_000.0)
+
+        def add(index: int) -> None:
+            CompanyWizard(handler).add_risk(f"Risk {index}", "medium", "medium")
+
+        threads = [threading.Thread(target=add, args=(index,)) for index in range(15)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(15)
+
+        wizard = CompanyWizard(handler)
+        assert wizard.list_risks()["total_count"] == 15
+        entries = wizard.list_audit_entries(limit=100)["entries"]
+        assert [entry["action"] for entry in entries].count("risk_added") == 15
+        assert sorted(entry["seq"] for entry in entries) == list(range(1, 17))
+
+    def test_write_waits_for_an_external_lock(self, tmp_path: Path) -> None:
+        handler = FileHandler(data_dir=tmp_path / "company_data")
+        wizard = CompanyWizard(handler)
+        wizard.init_company("Acme", "Yazilim", 1_000.0)
+
+        started = threading.Event()
+        finished = threading.Event()
+
+        def add() -> None:
+            started.set()
+            wizard.add_risk("Geç kalan risk", "low", "low")
+            finished.set()
+
+        with handler.cross_process_lock():
+            thread = threading.Thread(target=add)
+            thread.start()
+            assert started.wait(5)
+            assert not finished.wait(0.4)
+        thread.join(10)
+        assert finished.is_set()
+        assert wizard.list_risks()["total_count"] == 1

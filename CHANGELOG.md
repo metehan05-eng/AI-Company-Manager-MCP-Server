@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors that explain what exists. Each change already on disk can be audited from
   initialization through notes, migration backups and risk edits, and dry-run/read-only calls
   never add an entry.
+- **Cross-process write locking**: every mutating operation holds an advisory file lock for its
+  whole read-modify-write, so two MCP servers pointed at the same `COMPANY_DATA_DIR` can no
+  longer lose updates or interleave journal entries. The lock is reentrant (a public method
+  calling `_commit` is a no-op) and uses `fcntl.flock` on POSIX and `msvcrt.locking` on
+  Windows. Its file lives in the system temporary directory, keyed by a hash of the data
+  directory's absolute path, so the data directory stays clean. The lock is per host: a data
+  directory shared over a network filesystem is not coordinated.
 - `get_variance_report` tool: a read-only month-by-month look at the ledger against the plan.
   Groups records by `YYYY-MM`, reports `initial_budget`, `spent`, `remaining`, `over_budget`
   and `used_percent`, and compares every month with the one before it (absolute change and
@@ -95,8 +102,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed initialization no longer leaves an empty `audit_log.json` behind: when the
   journal file was created by the failed call, the rollback removes it along with the core
   files, so nothing is left on disk for a company that was never initialized.
-- Documented that the audit `seq` assumes a single MCP process owns `COMPANY_DATA_DIR`: two
-  servers sharing one directory could interleave journal entries.
 - Cross-file problems in the migration plan are now answerable open items
   (`company_profile.json:currency`, `financials.json:company_name`) instead of plain text
   questions, so they can be confirmed with `apply_company_data_migration`.

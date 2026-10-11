@@ -611,9 +611,10 @@ through the operating system.
 - Financial and employee changes run under a single wizard lock.
 - Changes are journaled before the data write; a failed write rolls the journal entry back,
   so the log only describes changes that are on disk.
-- The audit `seq` and the journal-first write assume a single MCP process owns the data
-  directory at a time; two servers pointed at the same `COMPANY_DATA_DIR` could interleave
-  journal entries.
+- Every mutating operation also takes an advisory cross-process lock, so two servers pointed
+  at the same `COMPANY_DATA_DIR` cannot interleave journal entries or lose updates. The lock
+  file lives in the system temporary directory (never in the data directory) and works per
+  host: a data directory shared over a network filesystem is not coordinated.
 - JSON structure, numeric fields, dates and table columns are validated.
 - Formula injection is neutralized in CSV and XLSX cells with a prefix character.
 - The installer merges MCP configurations instead of overwriting them.
