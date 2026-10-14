@@ -317,6 +317,39 @@ class TestLegacyEmployeeSchema:
         assert "EMP-0001" in list(frame["employee_id"])
 
 
+class TestEmployeeColumnCollisions:
+    """A file may carry both a canonical column and an alias for the same field."""
+
+    def test_alias_does_not_collide_with_canonical_column(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "id,full_name,role,department,salary,employee_id\nX9,Ayse,Dev,IT,5000,EMP-0042\n",
+            encoding="utf-8",
+        )
+        result = wizard.add_employee("Bora", "QA", "IT", 6_000.0)
+        assert result["employee"]["employee_id"] == "EMP-0043"
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        assert list(frame["employee_id"]) == ["EMP-0042", "EMP-0043"]
+        assert list(frame["id"]) == ["X9", ""]
+
+    def test_unparseable_start_date_is_preserved(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "employee_id,name,role,department,salary,start_date,status\n"
+            "EMP-0007,Ayse,Dev,IT,5000,05/31/2024,on_leave\n",
+            encoding="utf-8",
+        )
+        wizard.add_employee("Bora", "QA", "IT", 6_000.0)
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        existing = frame.set_index("employee_id").loc["EMP-0007"]
+        assert existing["start_date"] == "05/31/2024"
+        assert existing["status"] == "on_leave"
+
+
 class TestInspectDataSchema:
     def test_reports_all_files(self, company: CompanyWizard) -> None:
         report = company.inspect_data_schema()
@@ -401,6 +434,21 @@ class TestMigrateCompanyData:
         assert header == (
             "employee_id,name,role,department,salary,start_date,status,performance_score"
         )
+
+    def test_migration_tolerates_alias_beside_canonical(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "employees.csv").write_text(
+            "id,full_name,role,department,monthly_salary_usd,employee_id\n"
+            "X9,Ayse,Dev,IT,5000,EMP-0042\n",
+            encoding="utf-8",
+        )
+        result = wizard.migrate_company_data(apply=True)
+        assert result["changed"] is True
+        frame = pd.read_csv(data_dir / "employees.csv", dtype=object, keep_default_na=False)
+        assert list(frame["employee_id"]) == ["EMP-0042"]
+        assert "id" in result["preserved_extra_columns"]
 
     def test_apply_creates_backup(self, wizard: CompanyWizard, data_dir: Path) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -859,6 +907,19 @@ class TestPlanCompanyDataMigration:
         plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
         assert "expected 'template' or 'active'" in plan["incompatible_values"][0]["reason"]
 
+    def test_inactive_is_not_silently_read_as_active(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_json(
+            data_dir,
+            "company_profile.json",
+            {"company_name": "A", "sector": "B", "status": "inactive"},
+        )
+        plan = wizard.plan_company_data_migration()["files"]["company_profile.json"]
+        assert plan["incompatible_values"] == [
+            {"field": "status", "reason": "expected 'template' or 'active', received 'inactive'"}
+        ]
+
     def test_bad_date_is_reported(self, wizard: CompanyWizard, data_dir: Path) -> None:
         write_json(
             data_dir,
@@ -1030,6 +1091,16 @@ class TestApplyCompanyDataMigration:
         assert result["changed"] == []
         assert result["backups"] == {}
         assert "already matched" in result["message"]
+
+    def test_apply_does_not_rewrite_matched_files(
+        self, wizard: CompanyWizard, data_dir: Path
+    ) -> None:
+        write_real_files(data_dir)
+        wizard.apply_company_data_migration(answers=full_answers(), apply=True)
+        before = snapshot(data_dir)
+        result = wizard.apply_company_data_migration(answers={}, apply=True)
+        assert result["changed"] == []
+        assert snapshot(data_dir) == before
 
     def test_explicit_value_overrides_proposal(self, wizard: CompanyWizard, data_dir: Path) -> None:
         write_real_files(data_dir)

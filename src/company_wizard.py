@@ -240,17 +240,44 @@ def _resolve_employee_columns(columns: list[object]) -> dict[object, str]:
 
     Unrecognized columns are intentionally left out of the mapping so that
     caller-defined data such as `performance_score` survives a read/write cycle.
+    When two headers normalize onto the same canonical field (for example `id`
+    and `employee_id`), only the first is mapped and the rest stay as extra
+    columns, so a duplicated canonical column can never be created.
     """
+    canonical_present = {_normalize_column_key(column) for column in columns} & set(
+        EMPLOYEE_COLUMNS
+    )
     resolved: dict[object, str] = {}
     for column in columns:
         key = _normalize_column_key(column)
+        target: str | None
         if key in EMPLOYEE_COLUMNS:
-            resolved[column] = key
-            continue
-        alias = EMPLOYEE_COLUMN_ALIASES.get(key)
-        if alias is not None and alias not in resolved.values():
-            resolved[column] = alias
+            target = key
+        else:
+            target = EMPLOYEE_COLUMN_ALIASES.get(key)
+            if target in canonical_present:
+                # A real canonical column is already present, so the alias must
+                # not rename onto it (that would leave two identical labels).
+                target = None
+        if target is not None and target not in resolved.values():
+            resolved[column] = target
     return resolved
+
+
+def _dedupe_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rename repeated column labels so a frame can never hold duplicate headers."""
+    seen: dict[str, int] = {}
+    labels: list[object] = []
+    duplicated = False
+    for column in frame.columns:
+        name = str(column)
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 1:
+            labels.append(column)
+        else:
+            labels.append(f"{name}_{seen[name]}")
+            duplicated = True
+    return frame.set_axis(labels, axis=1) if duplicated else frame
 
 
 def _normalize_employee_id(value: object) -> str:
@@ -288,6 +315,10 @@ def _assign_employee_ids(values: pd.Series) -> pd.Series:
     return pd.Series(filled, index=values.index, dtype=object)
 
 
+_INACTIVE_STATUS_TOKENS = {"inactive", "pasif", "left", "terminated", "false", "0", "no"}
+_ACTIVE_STATUS_TOKENS = {"active", "aktif", "current", "employed", "true", "1", "yes", "evet"}
+
+
 def _default_employee_start_date(value: object) -> str:
     text = str(value).strip()
     if not text:
@@ -297,14 +328,23 @@ def _default_employee_start_date(value: object) -> str:
             return datetime.strptime(text, pattern).date().isoformat()
         except ValueError:
             continue
-    return _utc_today().isoformat()
+    # A value that is present but unrecognized must survive the read/write cycle
+    # untouched: replacing it with today's date would silently destroy data.
+    return text
 
 
 def _default_employee_status(value: object) -> str:
-    text = str(value).strip().casefold()
-    if text in {"inactive", "pasif", "left", "terminated", "false", "0", "no"}:
+    text = str(value).strip()
+    folded = text.casefold()
+    if not folded:
+        return "active"
+    if folded in _INACTIVE_STATUS_TOKENS:
         return "inactive"
-    return "active"
+    if folded in _ACTIVE_STATUS_TOKENS:
+        return "active"
+    # Keep custom life-cycle stages (for example "on_leave") instead of calling
+    # them "active", which would change the meaning of every existing row.
+    return text
 
 
 def _normalize_money(value: float | str, field_name: str) -> Decimal:
@@ -318,6 +358,23 @@ def _normalize_money(value: float | str, field_name: str) -> Decimal:
     if isinstance(exponent, int) and exponent < -2:
         raise ValueError(f"{field_name} must have at most 2 decimal places (received {value})")
     return amount
+
+
+def _validation_error_summary(exc: Exception) -> str:
+    """Turn a pydantic validation error into one readable line naming the fields.
+
+    Pydantic's ``str()`` starts with a bare "N validation errors for Model" header
+    that hides *why* validation failed, so the offending fields are appended.
+    """
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        details = [
+            f"{'.'.join(str(part) for part in item.get('loc', ())) or 'value'}: {item.get('msg')}"
+            for item in errors()[:3]
+        ]
+        if details:
+            return f"{str(exc).splitlines()[0]} ({'; '.join(details)})"
+    return str(exc).splitlines()[0]
 
 
 def _transform_copy(value: Any) -> tuple[Any, str | None]:
@@ -366,7 +423,7 @@ def _transform_lifecycle_status(value: Any) -> tuple[Any, str | None]:
         if folded == canonical:
             return canonical, None
     for canonical in ("template", "active"):
-        if canonical in folded:
+        if re.search(rf"\b{canonical}\b", folded):
             return canonical, (
                 f"The canonical status only accepts 'template' or 'active', so {text!r} "
                 f"was read as {canonical!r}. Move the extra wording into a note if needed."
@@ -1122,7 +1179,7 @@ class CompanyWizard:
             ) from exc
 
         mapping = _resolve_employee_columns(list(frame.columns))
-        renamed = frame.rename(columns=mapping)
+        renamed = _dedupe_columns(frame.rename(columns=mapping))
         extra_columns = [column for column in renamed.columns if column not in EMPLOYEE_COLUMNS]
 
         missing_columns = [
@@ -1251,7 +1308,7 @@ class CompanyWizard:
             except (FileNotFoundError, ValueError) as exc:
                 report["files"][filename] = {
                     "status": "incompatible",
-                    "reason": str(exc).splitlines()[0],
+                    "reason": _validation_error_summary(exc),
                 }
             else:
                 report["files"][filename] = {"status": "compatible"}
@@ -1267,8 +1324,13 @@ class CompanyWizard:
         """Convert employees.csv to the canonical schema, with a timestamped backup.
 
         The call is a dry run unless `apply` is True. Unknown columns are preserved
-        so caller-defined data is never discarded.
+        so caller-defined data is never discarded. The whole read-modify-write runs
+        under the write lock so a concurrent writer cannot interleave with it.
         """
+        with self._transaction():
+            return self._migrate_company_data(apply)
+
+    def _migrate_company_data(self, apply: bool = False) -> dict[str, Any]:
         employees_path = self.file_handler.data_dir / "employees.csv"
         if not employees_path.exists():
             raise FileNotFoundError("employees.csv was not found; initialize a company first")
@@ -1280,7 +1342,7 @@ class CompanyWizard:
 
         original_columns = [str(column) for column in raw.columns]
         mapping = _resolve_employee_columns(list(raw.columns))
-        renamed = raw.rename(columns=mapping)
+        renamed = _dedupe_columns(raw.rename(columns=mapping))
         extra_columns = [
             column
             for column in renamed.columns
@@ -1530,7 +1592,7 @@ class CompanyWizard:
         try:
             validated = model_type.model_validate(candidate)
         except ValueError as exc:
-            validation_error = str(exc).splitlines()[0]
+            validation_error = _validation_error_summary(exc)
 
         if validation_error is None and not questions:
             # Only hand over a ready-to-use document when nothing is left to decide,
@@ -1688,8 +1750,15 @@ class CompanyWizard:
         Every open item reported by plan_company_data_migration must be answered. An
         answer of `true` accepts the proposed value; any other answer is used as the
         final value. Nothing is written unless apply is True, and a timestamped backup
-        of each changed file is written first.
+        of each changed file is written first. The whole read-modify-write runs under
+        the write lock so a concurrent writer cannot interleave with it.
         """
+        with self._transaction():
+            return self._apply_company_data_migration(answers, apply)
+
+    def _apply_company_data_migration(
+        self, answers: dict[str, Any] | None = None, apply: bool = False
+    ) -> dict[str, Any]:
         given = {str(key): value for key, value in (answers or {}).items()}
         report, candidates, open_items = self._build_migration_plan()
         models: dict[str, type[BaseModel]] = {
@@ -1749,7 +1818,7 @@ class CompanyWizard:
             except ValueError as exc:
                 raise ValueError(
                     f"{filename} is still invalid after applying the answers: "
-                    f"{str(exc).splitlines()[0]}"
+                    f"{_validation_error_summary(exc)}"
                 ) from exc
 
         changed = [
@@ -1779,8 +1848,6 @@ class CompanyWizard:
         backup_plan = {name: name.replace(".json", f".backup-{stamp}.json") for name in changed}
 
         if not changed:
-            for name, model_type in models.items():
-                self._write_model(name, model_type.model_validate(documents[name]))
             result["message"] = "Both files already matched; nothing was written."
             return result
 

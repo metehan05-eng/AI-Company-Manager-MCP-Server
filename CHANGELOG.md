@@ -116,6 +116,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same file migrated twice produced different ids. Ids are now derived from row order, and
   migrating the same input twice is byte-identical. Covered by a test that compares two
   interpreters with different `PYTHONHASHSEED` values.
+- `add_employee` silently rewrote existing rows: a `start_date` that matched none of the
+  accepted formats (for example `05/31/2024`) was overwritten with today's date and any
+  status other than the known active/inactive words (for example `on_leave`) was changed to
+  `active`, then persisted. Present-but-unrecognized values are now kept exactly as they
+  are; only genuinely blank cells still fall back to today/`active`.
+- An `employees.csv` that carried a canonical column *and* one of its aliases (for example
+  both `employee_id` and `id`) produced two columns with the same name, which crashed
+  `add_employee`/`migrate_company_data`. A real canonical column now always wins and the
+  alias is kept as a preserved extra column; any remaining duplicate labels are suffixed so
+  a frame can never hold two identical headers.
+- A profile whose status was `inactive` was silently read as `active`, because the lenient
+  substring match (`"active" in "inactive"`) fired before the value was rejected. Status
+  tokens now match on word boundaries, so `inactive` is reported as an incompatible value
+  to resolve instead of being misread.
+- `apply_company_data_migration` rewrote both files even when it reported "nothing was
+  written", which could still touch the bytes and the modification time. The already-matched
+  branch now returns without writing anything.
+- Validation failures surfaced by the migration tools dropped everything after pydantic's
+  bare `N validation errors for Model` header, hiding the offending field. The reason now
+  appends up to three `field: message` pairs.
+- `migrate_company_data` and `apply_company_data_migration` read the current files before
+  taking the write lock, so a concurrent writer could be overwritten (lost update). Both
+  now hold the lock across the whole read-modify-write, matching the documented guarantee.
 
 ### Not changed
 
